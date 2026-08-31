@@ -1,0 +1,179 @@
+# @package alignment
+# Kernel CCA on kernel data (Huang, Lee and Hsiao, 2009).
+#
+# The paper's move is to avoid a kernelised eigenproblem entirely: turn
+# each space into a "kernel data" matrix K^(i) = kappa_i(X^(i), X^(i)),
+# regularise it by dropping columns, and run *classical* LCCA on the
+# result. So this is `cca` with one thing changed -- the canonical stage
+# is handed psi_1(Z_src) and psi_2(Z_tgt) instead of Z_src and Z_tgt --
+# which makes it the direct non-linear counterpart of that baseline.
+#
+#   f(z) = (psi_1(z) A) R
+#
+# `R` is the pre-image: CCA between two Euclidean spaces colours with
+# B^+, but psi_2 cannot be run backwards, so the map back into the
+# receiver's raw latents is a ridge readout fitted on the *target's* own
+# canonical scores. See the note under `readout`.
+#
+# Against the other kernel method in the field: RKA reaches non-linearity
+# by adding a kernel correction on top of a rigid map, and transmits
+# coordinates; this runs the whole alignment in feature space, and
+# transmits canonical scores.
+
+_target_: src.alignment.KCCAAligner
+_convert_: all
+
+# --- kernel -----------------------------------------------------------
+# The paper uses the Gaussian kernel throughout, which is `rbf` here.
+kernel: rbf               # rbf | laplacian | polynomial | linear | cosine
+
+# kappa_2, the receiver's kernel. null reuses `kernel`; the bandwidths
+# are fitted per space either way, so the two are already distinct
+# kernels. Set `linear` for a receiver space that should not be
+# kernelised at all -- Example 3 of the paper does this, keeping its
+# class-indicator side untransformed.
+kernel_tgt: null
+
+gamma: null               # null -> the `bandwidth` heuristic below
+
+# How an unset gamma is chosen.
+#
+#   rule_of_thumb  the paper's Sec. 3.2 window, sigma^2 = 10 S with S the
+#                  sample variance: "might not be optimal or even far
+#                  from being optimal, [but] robust and satisfactory"
+#   median         the median-pairwise-distance heuristic the rest of
+#                  this package uses, which makes the kernel directly
+#                  comparable with `rkhs`'s
+#
+# The paper's width is coordinatewise (sigma_l = sqrt(10 S_l)), i.e. an
+# anisotropic kernel; the isotropic reduction used here coincides with it
+# exactly under `preprocess: standard`, which is why that is the default.
+bandwidth: rule_of_thumb
+bandwidth_scale: 1.0      # >1 smooths, <1 sharpens
+
+degree: 3                 # polynomial kernel only
+coef0: 1.0                # polynomial kernel only
+
+# --- reduced-column regularisation (Sec. 3.1) -------------------------
+# The paper's central implementation claim: a Gram matrix has "effective
+# rank much lower than its size", so the canonical stage inverts singular
+# covariances -- and the fix is to drop columns of the kernel data, not
+# to add a ridge, which "does not solve the problem of inferior
+# estimation". Three routes:
+#
+#   svd     optimal basis subset (Eqs. 5-6): keep the leading
+#           eigenvectors of K. The better approximation, and the paper's
+#           recommendation for small problems.
+#   subset  random basis subset (Eq. 7): keep m sampled points and use
+#           the thin K~ = kappa(X, X~). "The most economic one among the
+#           three", recommended as n grows -- and the only route whose
+#           deployed map is sparse, since it stores m kernel centres
+#           where `svd` stores the whole pool (`map_parameters` shows it).
+#   hybrid  a random subset first, then the SVD cut inside it.
+basis: svd
+
+# Size of each space's reduced kernel data. What it counts follows
+# `basis`:
+#
+#   under `subset`          basis *points* (int), or a fraction of the
+#                           pool (float)
+#   under `svd` / `hybrid`  singular directions (int), or a fraction of
+#                           the *eigenvalue* mass (float)
+#
+# 0.99 is the paper's own setting ("the extracted optimal bases make up
+# 99% of eigenvalues"). Note this float is not SVCCA's: that one is a
+# fraction of the variance and so sums squared singular values.
+#
+# null reduces nothing, which hands the canonical stage a rank-deficient
+# covariance and leaves `reg` to carry it -- the situation Sec. 3.1
+# exists to avoid.
+#
+# Watch `kcca_columns_src` / `kcca_columns_tgt` in the summary for what
+# was actually kept, and `kcca_min_correlation`: pinned at ~1 means the
+# kernel data is interpolating the pilots and these need lowering.
+n_basis_src: 0.99
+n_basis_tgt: 0.99
+
+# Random-subset size of `basis: hybrid`, drawn before the SVD cut. null
+# uses the whole pool, at which point `hybrid` degenerates to `svd`.
+n_subset: null
+
+# How `subset`/`hybrid` draw their basis points: random | kmeans | fps |
+# stratified | herding. The paper uses uniform random, and stratified
+# uniform in its Pendigits example. Unlike a *pilot* design this costs no
+# airtime -- the basis set is a single-space object, drawn from local
+# data -- so the better designs are free here.
+subset_strategy: random
+
+# --- how many canonical directions to keep ----------------------------
+# THIS is the rate, exactly as in `cca`: the transmitter evaluates
+# psi_1(z) A locally and puts k numbers on the channel, the receiver
+# applies R. Unlike the linear methods there is no competing bound from
+# d_src -- the kernel data has m_1 columns whatever the latent width --
+# so this is the only thing holding the rate down, and null lets it rise
+# to min(m_1, m_2), which can exceed d_src. Pin it for a rate-matched
+# comparison.
+n_canonical: null
+
+# --- regularisation ---------------------------------------------------
+# Ridge on both kernel-data covariances, relative to their mean
+# eigenvalue. Per the paper this is a floor that keeps the two inversions
+# finite, not the regulariser: buy conditioning with `n_basis_*` first.
+reg: 1.0e-3
+
+# --- the pre-image ----------------------------------------------------
+# Which side's canonical scores the readout R is fitted on. Both use the
+# identical canonical solution; they differ only in how the decoder on
+# top of it is estimated.
+#
+#   source  fit R on psi_1(Z_src) A -- the scores it will actually be
+#           applied to. This is Example 3 of the paper, which feeds the
+#           KCCA-found variates of its inputs to a discriminant fitted on
+#           those same variates, and it is the stronger of the two: on a
+#           smooth synthetic pair, over budgets N = 30..500 and three
+#           strengths of non-linearity, it was never worse and won by
+#           3-5% of held-out NMSE.
+#   target  fit R on psi_2(Z_tgt) B instead, the strict analogue of CCA's
+#           B^+. Use it when the question is whether the shared subspace
+#           is right rather than how well a decoder rides on top of it;
+#           `kcca_readout_r2` (the receiver's own ceiling) against
+#           `kcca_transfer_r2` (through the deployed path) is the same
+#           question asked of a single fit.
+readout: source
+readout_reg: 1.0e-6
+
+# --- cost guard -------------------------------------------------------
+# Cap on the calibration points the kernel and basis are estimated on;
+# the reduction is O(n^2 m) in time and O(n m) in memory, and with
+# `basis: svd` every one of them becomes a kernel centre the deployed map
+# carries.
+#
+# Note this method does *not* take its basis from `src_context` /
+# `tgt_context` the way `svcca` takes its SVD basis. The basis is a
+# single-space object, but the canonical stage that consumes it is not,
+# and it supports at most as many kernel columns as there are pilots (the
+# implementation caps them there). A basis drawn from a larger local pool
+# outgrows the budget rather than improving on it: measured at 30-100
+# pilots on a smooth synthetic pair it cost 0.127 -> 0.197 held-out NMSE.
+max_points: 2000
+
+# --- standardisation --------------------------------------------------
+# Unlike CCA this method is *not* invariant to a change of basis -- the
+# kernel sees the coordinates -- so `none` is not an option the way it is
+# in `cca.yaml`. z-scoring is what makes the paper's coordinatewise
+# window width exact.
+preprocess: standard
+eps: 1.0e-6
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for the rest of the canonical-correlation family:
+# the stage that costs pilots is still an LCCA inverting two covariances,
+# and it wants a pilot sample that represents the pool.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# The canonical rank, as in `cca` -- the map factorises through it.
+rate_key: n_canonical
+
+seed: ${seed}

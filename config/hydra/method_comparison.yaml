@@ -1,0 +1,175 @@
+# RKA against the alignment methods of the literature, at a fixed budget.
+#
+# The companion to pilot_efficiency.yaml with the axes swapped: there the
+# pilot budget sweeps and the method field is small, here the budget is
+# *pinned* and the whole published field runs on it. Every method sees the
+# same pilot sets, so the ranking is about the methods and not about which
+# samples each one happened to draw.
+#
+#   uv run scripts/method_comparison.py
+#   uv run scripts/method_comparison.py pilots.n_pilots=250
+#   uv run scripts/method_comparison.py data=semasia_mnist
+#
+# Editing the field from the command line:
+#   uv run scripts/method_comparison.py '~methods.affine' '~methods.cca'
+#   uv run scripts/method_comparison.py methods.ppfe.n_anchors=1024
+#   uv run scripts/method_comparison.py methods.kcca.basis=subset
+#
+# Repeating the whole comparison at several budgets (separate runs):
+#   uv run scripts/method_comparison.py -m pilots.n_pilots=100,500,2000
+
+defaults:
+  - data: semasia
+  - alignment@methods.rkhs: rkhs
+  - alignment@methods.procrustes: procrustes    # their `ortho`
+  - alignment@methods.linear: linear            # their `linear`
+  - alignment@methods.l_ortho: l_ortho          # their `l-ortho`
+  - alignment@methods.affine: affine            # their `affine`
+  - alignment@methods.cca: cca
+  - alignment@methods.kcca: kcca         # Huang et al.'s kernel CCA
+  - alignment@methods.rr: rr
+  - alignment@methods.ppfe: ppfe
+  - _self_
+
+seed: 42
+
+highlight: rkhs
+
+# --- encoder pairs ----------------------------------------------------
+# Same contract as the other studies: null builds a star into `receiver`
+# (the first agent of the data config when that is null too).
+pairs: null
+receiver: null
+max_pairs: 4
+
+# --- the fixed calibration budget -------------------------------------
+# This is the whole point of the study: N does not vary. But it has to be
+# set high enough that every method in the field is actually operating,
+# and RKA is the binding constraint.
+#
+# The orthogonality constraint G X^T = 0 confines the residual to
+# range(K) n ker(X), so its degrees of freedom are rank(K) - rank(X),
+# which for a strictly positive-definite kernel is about N - d_src. At
+# N ~ d_src the residual is annihilated outright and RKA is *identically*
+# its own Procrustes backbone; a little above it, the correction has a
+# handful of directions to spend and explains nothing. Either way the
+# comparison silently measures Procrustes twice.
+#
+# So the budget must clear roughly twice the wider latent dimension,
+# which leaves the residual as many directions as the rigid stage has.
+# The default SEMASIA agents run to d = 1024, hence 2048 here; for
+# `data=semasia_mnist`, whose two agents are 384 and 768, 1536 is the
+# matching figure.
+# `rkhs_capacity` in the diagnostics CSV reports the realised figure, and
+# the run log shows the symptom directly -- `RKHS: selected lam=...
+# (val_nmse=0.999)` is the residual reporting that it explained nothing.
+pilots:
+  n_pilots: 2048        # null = the whole training split
+
+  # How the pilots are chosen: random | kmeans | fps | stratified |
+  # herding.
+  #
+  # null -- the default -- means *each method uses the design its own
+  # preset declares* under `pilot_strategy`, so every method is measured
+  # in the configuration its authors intended:
+  #
+  #   rkhs, direct_mlp, residual_mlp   herding   (the RKA paper's own
+  #                                              kernel-aware design,
+  #                                              chosen in the same RKHS
+  #                                              the residual is fitted in)
+  #   procrustes, linear, affine,      herding   (a cross-covariance or a
+  #   l_ortho, cca, kcca                         least-squares design
+  #                                              matrix wants a sample
+  #                                              that represents the pool)
+  #   ppfe, relative                   kmeans    (matching the k-means
+  #                                              prototypical anchors the
+  #                                              frame is built from)
+  #   rr                               fps       (its own refinement step
+  #                                              is FPS under the |cosine|
+  #                                              distance, so the pilots
+  #                                              are drawn the same way)
+  #
+  # Methods sharing a design are fitted on the *same* pilot set, so they
+  # stay directly comparable with each other.
+  #
+  # Naming one here overrides all of them and puts the whole field on a
+  # single shared pilot set, which isolates the map from the calibration
+  # design -- the stricter comparison, and worth running alongside:
+  #
+  #   uv run scripts/method_comparison.py pilots.strategy=herding
+  #
+  # With the field on herding above, the override changes only `ppfe` and
+  # `rr`, so the two runs should now agree closely. They did not before:
+  # farthest-point sampling returns the *extremes* of the latent cloud
+  # rather than a representative subset, and it cost Procrustes 0.917 ->
+  # 0.481 accuracy on the SEMASIA MNIST pair purely by changing the pilot
+  # design. That measurement is why the linear-like family is on herding;
+  # the table is in config/hydra/alignment/procrustes.yaml.
+  strategy: null
+
+  # Used only for a method whose preset declares no `pilot_strategy`.
+  fallback_strategy: herding
+
+  # The deterministic designs (herding, fps) return the same pilots every
+  # repeat over a fixed pool, so raise this only alongside a randomised
+  # `strategy` override.
+  n_repeats: 1
+
+# Note the anchor-based methods draw their anchors from these pilots, so
+# their `n_anchors` is capped by `pilots.n_pilots` (with a warning). The
+# Parseval Frame Equalizer wants N >= max(d_src, d_tgt) for an exact
+# reconstruction, which on the vit_large pair means >= 1024 pilots.
+
+# The budget is necessary but not sufficient: `rkhs.yaml` also ships with
+# `n_components: null`, i.e. full-rank whitening, which flattens the
+# spectrum so far that the centred RBF Gram matrix degenerates towards
+# the identity and the residual has no smooth subspace to select. If RKA
+# still tracks Procrustes once the budget clears 2 d_src, truncate the
+# whitening as well:
+#
+#   uv run scripts/method_comparison.py methods.rkhs.n_components=12
+#
+# See the note in config/hydra/alignment/rkhs.yaml for the measured
+# effect (+0.000 at full rank, +0.013 at k = 12 on a SEMASIA ViT pair).
+
+# --- receiver decoder (post-alignment accuracy) -----------------------
+decoder:
+  enabled: true
+  kind: linear                  # linear (timm-style ridge probe) | mlp
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+eval:
+  # One panel per metric; the first one sets the ranking.
+  metrics: [accuracy, mrr]
+  topk: [1, 5]
+
+# --- output -----------------------------------------------------------
+output_dir: figures
+plot_title: null
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

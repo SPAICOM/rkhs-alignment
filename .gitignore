@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ruff_cache/
+.pytest_cache/
+.vscode/
+.claude/
+
+# Hydra run outputs
+outputs/
+multirun/
+figures/
+idea.md
+
+# Weights & Biases run data
+wandb/
+
+# Trained decoder checkpoints
+models/
+
+# OS
+.DS_Store
+
+# Notes
+refs/
+*.pdf

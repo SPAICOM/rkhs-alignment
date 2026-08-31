@@ -1,0 +1,105 @@
+# Latent-space alignment experiment.
+#
+# Fits one alignment map per (source -> target) encoder pair on the train
+# split (the calibration set), evaluates it on the held-out test split,
+# and logs everything to Weights & Biases.
+#
+# Common overrides
+# ----------------
+#   # pick the method and its hyper-parameters
+#   uv run scripts/evaluate_alignment.py alignment=rkhs
+#   uv run scripts/evaluate_alignment.py alignment=relative alignment.n_anchors=256
+#
+#   # the regularisation term of whichever method is active
+#   uv run scripts/evaluate_alignment.py alignment=rkhs alignment.lam=1e-2
+#   uv run scripts/evaluate_alignment.py alignment=linear alignment.alpha=1e-3
+#
+#   # which encoders to align, and where the run is logged
+#   uv run scripts/evaluate_alignment.py \
+#       'pairs=[{source: resnet50.a1_in1k, target: vit_small_patch16_224.augreg_in1k}]' \
+#       wandb.project=my-project
+#
+#   # sweep the regularisation across separate runs
+#   uv run scripts/evaluate_alignment.py -m alignment=rkhs alignment.lam=1e-4,1e-3,1e-2
+#
+#   # offline synthetic agents, no Hub download
+#   uv run scripts/evaluate_alignment.py data=synthetic receiver=agent_00
+
+defaults:
+  - data: semasia
+  - alignment: rkhs
+  - _self_
+
+seed: 42
+
+# --- which encoders to align -----------------------------------------
+# Each entry maps a source (transmitter) onto a target (receiver): the
+# source's latents are transported into the target's own latent space.
+# Only the encoders actually referenced here are ever loaded.
+#
+#   pairs:
+#     - source: convnext_base.fb_in1k
+#       target: resnet50.a1_in1k
+#     - source: resnet50.a1_in1k
+#       target: vit_small_patch16_224.augreg_in1k
+#
+# Left null, the pairs are derived as a star topology instead: every other
+# agent of the data source transmits to `receiver` (the first agent when
+# that is null too), capped at `max_pairs` senders.
+pairs: null
+receiver: null
+max_pairs: 8
+
+# --- receiver decoder (the downstream semantic-communication metric) ---
+decoder:
+  enabled: true
+
+  # The receiver's task head must be the *fixed* stage the paper assumes,
+  # not something expressive enough to re-learn the task from whatever it
+  # is handed. `linear` is TimmDecoder, a ridge probe mirroring the timm
+  # classifier head these latents were produced for.
+  #
+  # `mlp` is available but is a poor instrument here: with LayerNorm and
+  # 512 tanh units it decodes almost any linear image of the latents, so
+  # it reports ~0.90 even for a badly fitted map and lets transported
+  # latents score *above* the receiver's own (measured ratio 1.04). The
+  # linear probe is monotonic in alignment quality and stays below native.
+  kind: linear                  # linear (timm-style ridge probe) | mlp
+  checkpoint_dir: models/decoders
+  # Reuse a checkpoint when one exists, and save newly fitted decoders.
+  cache: true
+  n_classes: 10                 # linear probe only
+  l2: 1.0e-6                    # linear probe only
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+eval:
+  # Cut-offs of the nearest-neighbour retrieval metrics.
+  topk: [1, 5]
+  # Also score the rigid stage alone, as an in-run reference point.
+  # Only available for methods that expose one (currently RKHS).
+  log_linear_reference: true
+
+# --- logging ----------------------------------------------------------
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null                    # null -> "<alignment>-<data source>"
+  group: null
+  job_type: alignment
+  tags: []
+  mode: online                  # online | offline | disabled
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

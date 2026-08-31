@@ -1,0 +1,90 @@
+# @package alignment
+# SVCCA (Raghu et al., 2017): truncate each space to its own top singular
+# directions, then run canonical-correlation alignment inside the two
+# truncated bases.
+#
+#   f(z) = (z A) B^+,   A = P_src A_k,   B = P_tgt B_k
+#
+# The difference from `cca` is *where* the two covariances are estimated,
+# not the algebra: CCA is invariant to any invertible linear map of
+# either space, so an untruncated change of basis would change nothing.
+# Dropping the low-variance directions first removes exactly the ones
+# whose inverse square root is sampling noise, which is what makes the
+# method usable on wide encoder latents from a small pilot budget -- and
+# it drops the two eigendecompositions from d^3 to k^3.
+
+_target_: src.alignment.SVCCAAligner
+_convert_: all
+
+# --- SVD truncation, per space ----------------------------------------
+# The transmitter and the receiver are different encoders with different
+# widths and different spectral decay, so they get independent levels.
+#
+#   int    keep that many singular directions
+#   float  in (0, 1]: keep as many as explain that fraction of the
+#          space's variance -- the portable setting when the pair is not
+#          fixed, since it adapts to each encoder's own spectrum
+#   null   keep every direction the data spans (recovers plain CCA)
+#
+# Note the sklearn convention's sharp edge: `1` is one component, `1.0`
+# is all the variance.
+#
+# Neither level costs pilots. An SVD basis is a *single-space* statistic,
+# so each device estimates it from all of its own unpaired data whenever
+# the run passes `src_context` / `tgt_context` -- as every study script
+# does. Check `svcca_basis_from` in the summary: `pilots` means the
+# basis was estimated from the paired budget after all, and in the
+# low-N regime that is the noisy object the truncation exists to remove.
+svd_src: 0.99
+svd_tgt: 0.99
+
+# --- how many canonical directions to keep ----------------------------
+# THIS is the rate. The map factorises through k canonical coordinates:
+# the transmitter evaluates z A locally and puts k numbers on the
+# channel, the receiver applies B^+. Compression against the raw latent
+# is k / d_src, and `transmitted_symbols` in the summary reports k
+# rather than d_src for exactly this reason.
+#
+# null keeps min(k_src, k_tgt) -- the truncation levels cap it, so a
+# small `svd_src` already bounds the rate even when this is null.
+n_canonical: null
+
+# --- regularisation ---------------------------------------------------
+# Ridge on both within-subspace covariances, relative to their mean
+# eigenvalue. It sits an order of magnitude below the `cca` preset on
+# purpose: a well-chosen truncation is the better regulariser of the
+# two, since it drops the noisy directions instead of damping them. If
+# `cca_min_correlation` is pinned at ~1 the fit is interpolating the
+# pilots -- lower `svd_src`/`svd_tgt` first, and only then raise this.
+reg: 1.0e-4
+
+# --- standardisation --------------------------------------------------
+# None. The class centres itself in `_fit` and re-offsets in
+# `_transform`, so no preprocessing step is needed for correctness -- and
+# anything more than centring is actively wrong here, because the
+# truncation is not invariant to what comes before it. `standard`
+# rescales every feature to unit variance and so reshuffles the very
+# spectrum the SVD then ranks; `whiten` flattens it outright, at which
+# point "the top k directions" means nothing. Set `standard` only when
+# the raw features differ in scale for reasons that are not semantic.
+preprocess: none
+
+eps: 1.0e-6
+
+# Rank of the whitening; unused unless `preprocess: whiten`, and with
+# this method the truncation belongs in svd_src/svd_tgt instead.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for `cca` and the other linear-like maps: the
+# canonical stage still inverts two covariances, and wants a pilot
+# sample that represents the pool.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# Which knob `symbols` writes into for a rate-matched study. The
+# canonical rank, per the note above -- not the SVD level, which buys
+# accuracy rather than airtime.
+rate_key: n_canonical
+
+seed: ${seed}

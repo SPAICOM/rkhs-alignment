@@ -1,0 +1,117 @@
+# Sample efficiency versus the semantic-pilot budget (RKA paper, Figs. 2-3).
+#
+# Every method is fitted on the *same* pilot set at each budget, so the
+# curves are directly comparable. Two factors vary independently:
+#   `methods`            -> which aligners to compare  (colour in the plot)
+#   `pilots.strategies`  -> how the pilots are chosen  (line style)
+#
+# Reproducing the paper's two figures:
+#   # Fig. 2 -- pilot design, Procrustes vs RKA
+#   uv run scripts/pilot_efficiency.py
+#
+#   # Fig. 3 -- RKA against the neural baselines
+#   uv run scripts/pilot_efficiency.py \
+#       '~methods.direct_mlp' '~methods.residual_mlp' ...   # (see below)
+#
+# Switching benchmark:
+#   uv run scripts/pilot_efficiency.py data=semasia_mnist
+#   uv run scripts/pilot_efficiency.py data=semasia            # cifar10
+
+defaults:
+  - data: semasia
+  - alignment@methods.procrustes: procrustes
+  - alignment@methods.rkhs: rkhs
+  - alignment@methods.direct_mlp: direct_mlp
+  - alignment@methods.residual_mlp: residual_mlp
+  - _self_
+
+seed: 42
+
+# --- encoder pairs ----------------------------------------------------
+# Same contract as evaluate_alignment.yaml: null builds a star into
+# `receiver` (the first agent of the data config when that is null too).
+pairs: null
+receiver: null
+max_pairs: 4
+
+# --- pilot budget -----------------------------------------------------
+pilots:
+  # Budgets N to sweep (x-axis of the figure).
+  #
+  # The paper sweeps 25-250 on 12- and 16-dimensional latents. SEMASIA ViT
+  # latents are 192-1024 dimensional, so a cross-covariance only becomes
+  # full rank at N >= d_src: the paper's whole range would sit in the
+  # rank-deficient corner. The grid is extended to span under- to
+  # over-determined instead, which is where the curves actually separate.
+  counts: [25, 50, 100, 200, 400, 800, 1600]
+
+  # How the N pilots are picked out of the candidate pool:
+  #   random     -> uniform, the do-nothing baseline
+  #   stratified -> one quota per class (needs labels)
+  #   herding    -> kernel herding, the paper's kernel-aware design:
+  #                 greedily minimises the MMD to the full pool in the
+  #                 same RKHS the residual stage is fitted in
+  #   fps        -> farthest-point sampling
+  #   kmeans     -> k-means medoids
+  strategies: [random, herding]
+
+  # Independent realisations, giving the +/- 1 std band.
+  n_repeats: 5
+
+  # Candidate pool the pilots are drawn from. null = the whole SEMASIA
+  # training split, which is the intended setting: pilots are selected
+  # from everything the transmitter has. Note the consequence -- with a
+  # fixed pool the deterministic strategies (herding, fps) return the
+  # same pilots every repeat, so their band is flat by construction and
+  # only the randomised strategies show spread. Set an integer here to
+  # re-draw the pool per repeat and give every strategy an error bar.
+  pool_size: null
+
+# --- receiver decoder (post-alignment accuracy) -----------------------
+decoder:
+  enabled: true
+
+  # Must be the receiver's *fixed* task head, not something expressive
+  # enough to re-learn the task from whatever it is handed. `linear` is
+  # TimmDecoder, a ridge probe mirroring the timm classifier head. The
+  # `mlp` alternative reports ~0.90 even for a badly fitted map and lets
+  # transported latents beat the receiver's own latents, which makes it
+  # useless for ranking alignment methods.
+  kind: linear                  # linear (timm-style ridge probe) | mlp
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+eval:
+  # One panel per metric, in this order.
+  metrics: [accuracy, mrr]
+  topk: [1, 5]
+
+# --- output -----------------------------------------------------------
+output_dir: figures
+plot_title: null
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

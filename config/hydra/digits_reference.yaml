@@ -1,0 +1,76 @@
+# Pilot-budget sweep on Digits, through the reference RKA implementation.
+#
+# scripts/digits_reference_study.py is a direct transcription of the
+# standalone reference: whitening estimated once from the whole
+# calibration set (absolute eps, no shrinkage), RX head fitted once in
+# that whitened space and held fixed, median-heuristic bandwidth on the
+# pilots, B + 1e-8 I loading, and the reported RKA accuracy taken as the
+# best over the lambda grid. Only the pilot budget and the selection rule
+# vary.
+#
+#   uv run scripts/digits_reference_study.py
+#   uv run scripts/digits_reference_study.py 'pilots.counts=[20,60,140]'
+
+seed: 42
+
+# --- the two agents ---------------------------------------------------
+data:
+  tx_dim: 12               # transmitter hidden layer (tanh)
+  rx_dim: 16               # receiver hidden layer (relu)
+  holdout_fraction: 0.50   # 50% trains the encoders and the RX head
+  test_fraction: 0.30      # of the remainder: 35% calibration, 15% test
+  split_seed: 1
+  tx_seed: 10
+  rx_seed: 20
+
+# --- the sweep --------------------------------------------------------
+pilots:
+  counts: [20, 40, 60, 80, 100, 140, 180, 240]
+
+  # Realisations to average: seeds for the round-robin ordering, and pool
+  # draws for kernel herding (which is deterministic given a pool).
+  n_seeds: 12
+
+  # Candidate pool re-drawn per realisation. This is what gives herding an
+  # error bar -- on the full fixed pool it returns one number per budget,
+  # and a single realisation swings by ~0.01, which reads as structure
+  # that is not there. Set to null to recover the reference protocol
+  # exactly (herding once on all 629, round-robin over n_seeds).
+  pool_size: 500
+
+  # Multiplies the median-heuristic bandwidth used *for the herding
+  # selection only* (the RKA kernel keeps the plain median heuristic).
+  # Below 1 sharpens it, making the redundancy term more local.
+  herding_bandwidth: 0.2541
+
+# --- whitening --------------------------------------------------------
+# Estimated once on the whole calibration set. `absolute` reads eps as a
+# bare eigenvalue floor, matching the reference's np.maximum(eigvals, eps);
+# `relative` (the library default) scales it by the mean feature variance.
+whitening:
+  eps: 1.0e-6
+  eps_mode: absolute
+  shrinkage: null
+
+# --- RKHS residual ----------------------------------------------------
+rkhs:
+  # Loading on B = X H X^T before the solve.
+  ridge_B: 1.0e-8
+
+# --- RKHS regularisation ----------------------------------------------
+# Swept exactly as the reference does, with the reported RKA accuracy the
+# best over the grid. That is an oracle -- the maximum is taken on the
+# test set -- so it is an upper bound, not an achievable number.
+lambda_grid:
+  log_min: -6
+  log_max: 3
+  n: 32
+
+output_dir: figures
+plot_title: null
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false

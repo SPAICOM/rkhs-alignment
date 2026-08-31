@@ -1,0 +1,106 @@
+# @package alignment
+# Relative representations (Moschella et al. 2023): every agent re-encodes
+# its latents as similarities to a shared anchor set, then the code is
+# decoded back into the receiver's raw latent space so the comparison with
+# the other methods is like-for-like.
+#
+# Two named variants of the same machinery have their own presets:
+#   alignment=rr     Maiorca et al., inverse relative projection --
+#                    random anchors, no Parseval, anchor pruning
+#   alignment=ppfe   Fiorellino et al., Parseval Frame Equalizer with
+#                    prototypical (cluster-mean) anchors
+
+_target_: src.alignment.RelativeRepresentationAligner
+_convert_: all
+
+# --- anchor set -------------------------------------------------------
+# Capped at the pilot budget. With `parseval` on, K <= min(d_src, d_tgt)
+# gives a compression (the decode is an orthogonal projection onto the
+# anchor span) and K >= max(d_src, d_tgt) a redundant frame with exact
+# reconstruction; both are well conditioned.
+n_anchors: 256
+
+# random | kmeans | fps | stratified   ('stratified' needs labels)
+strategy: kmeans
+
+# For 'kmeans': snap each centroid to its nearest real sample, which is
+# what makes the anchors index-based and therefore shareable.
+medoids: true
+
+# How the source-selected anchors are rendered in the target space:
+#   indices  -> the target encoder re-embeds the same input samples
+#               (requires an index-based strategy)
+#   clusters -> the source's cluster structure is injected and each anchor
+#               is the centroid of its members in the target space
+#   prototypes -> the M samples actually averaged into each anchor are
+#               shared, and each agent means its own embeddings of them
+#               (Fiorellino et al., Alg. 1; see ppfe.yaml)
+anchor_transfer: indices
+
+# For anchor_transfer: prototypes, the M members averaged into each
+# prototype. null averages the whole cluster.
+n_prototype_samples: null
+
+# --- projection -------------------------------------------------------
+# 'cosine' keeps only the direction; the decode puts the result back on the
+# target's scale with one fitted factor (logged as rr_norm_scale).
+similarity: cosine        # cosine | inner
+
+# Orthonormalise the rows of each anchor projector (Parseval frame). Real
+# anchors are strongly correlated, so this is what makes P^+ well posed --
+# P P^T = I gives P^+ = P^T exactly. Needs n_anchors <= min(d_src, d_tgt).
+parseval: true
+
+# --- anchor refinement (Maiorca et al., inverse relative projection) ---
+# An alternative to `parseval` for conditioning the pseudo-inverse: prune
+# correlated anchors by farthest-point sampling under the |cosine|
+# distance (`prune_threshold` = their delta), and average over several
+# independently pruned subsets (`n_subspaces` = their omega). null and 1
+# leave both off, which is this preset. See rr.yaml.
+prune_threshold: null
+n_subspaces: 1
+
+# --- decoding back to the receiver's raw space ------------------------
+#   pinv  -> inverse relative projection, Z_hat = R P_tgt^+ (exact for
+#            similarity=inner on a well-conditioned projector)
+#   ridge -> the inversion fitted on the calibration pairs instead, which
+#            is what a non-linear `sim` needs; required by cosine
+decode: pinv
+
+# Regularisation of the `ridge` readout only; ignored by `pinv`.
+decode_alpha: 1.0e-2
+
+# Whitening flattens the spectrum, leaving a K-anchor span that covers far
+# less of the latent energy; it costs most of the retrieval accuracy here.
+preprocess: standard
+
+eps: 1.0e-6
+
+# Rank of the whitening: null keeps every direction, an int keeps the top-k
+# principal directions, a float in (0,1] keeps that fraction of variance.
+#
+# This matters more than any other knob on wide encoder latents. Full-rank
+# whitening equalises hundreds of noise directions with the signal ones,
+# and in that many dimensions all pairwise distances concentrate, so the
+# centred RBF Gram matrix degenerates towards the identity: its spectrum
+# is flat, lambda has no smooth subspace to select, and the residual can
+# only interpolate. Measured on a SEMASIA ViT pair at N=359 pilots, the
+# RKA-vs-Procrustes gap is +0.000 at full rank and +0.013 at k=12 -- the
+# paper's own latent dimensionality.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# k-means medoids, matching this preset's own anchor strategy: the
+# anchors are drawn from the pilots, so selecting both the same way means
+# the anchor set is a genuine k-means summary of the latent distribution
+# rather than a summary of an arbitrary subset of it.
+pilot_strategy: kmeans
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The anchor count: one similarity coefficient per
+# anchor is transmitted.
+rate_key: n_anchors
+
+seed: ${seed}

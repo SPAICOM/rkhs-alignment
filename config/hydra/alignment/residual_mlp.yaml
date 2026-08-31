@@ -1,0 +1,46 @@
+# @package alignment
+# Residual MLP baseline (RKA paper, Sec. V / Fig. 3): the Procrustes
+# solution is kept as a fixed backbone and the network learns only the
+# correction on top of it. Same decomposition as RKA -- f(x) = Qx + g(x) --
+# but with a trained g instead of the closed-form constrained kernel ridge,
+# and with no orthogonality constraint, so nothing stops it re-absorbing
+# linear structure that already belongs to Q.
+
+_target_: src.alignment.ResidualMLPAligner
+_convert_: all
+
+# See direct_mlp.yaml: scaled up from the paper's single 16-unit layer,
+# which is a rank-16 bottleneck at SEMASIA latent dimensions.
+hidden_units: [512, 256]
+activation: tanh
+alpha: 1.0e-1
+solver: lbfgs             # lbfgs | adam
+max_iter: 1000
+
+preprocess: whiten
+eps: 1.0e-6
+
+# Rank of the whitening: null keeps every direction, an int keeps the top-k
+# principal directions, a float in (0,1] keeps that fraction of variance.
+#
+# This matters more than any other knob on wide encoder latents. Full-rank
+# whitening equalises hundreds of noise directions with the signal ones,
+# and in that many dimensions all pairwise distances concentrate, so the
+# centred RBF Gram matrix degenerates towards the identity: its spectrum
+# is flat, lambda has no smooth subspace to select, and the residual can
+# only interpolate. Measured on a SEMASIA ViT pair at N=359 pilots, the
+# RKA-vs-Procrustes gap is +0.000 at full rank and +0.013 at k=12 -- the
+# paper's own latent dimensionality.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for `rkhs` and `direct_mlp` (RKA paper, Fig. 3).
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The whitening rank -- k coefficients on the channel.
+rate_key: n_components
+
+seed: ${seed}

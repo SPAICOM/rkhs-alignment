@@ -1,0 +1,67 @@
+# @package alignment
+# Canonical-correlation alignment: whiten each space, rotate onto the
+# shared canonical frame, colour into the receiver's geometry.
+#
+#   f(z) = (z^T A) B^+
+#
+# where A and B are the two spaces' canonical bases. It sits between
+# Procrustes and the unconstrained linear map: the rotation is free to
+# re-weight directions by how well they actually correlate across the two
+# encoders, but the map is still a single linear operator.
+
+_target_: src.alignment.CCAAligner
+_convert_: all
+
+# --- how many canonical directions to keep ----------------------------
+# THIS is the rate: the map factorises as f(z) = (z A) B^+, so the
+# transmitter evaluates `z A` locally and puts k numbers on the channel.
+#
+# null keeps min(d_src, d_tgt), which is both the largest number of
+# canonical pairs that exists and exactly the rank of the rectangular
+# Procrustes map on the same pair. Note that ceiling is a real one: on a
+# 2048 -> 384 pair no rate above 384 is reachable, whatever is requested,
+# and `transmitted_symbols` reports what was actually achieved.
+# An int truncates, which is CCA's own regulariser: the trailing
+# canonical directions are the ones a small pilot budget estimates from
+# noise.
+n_canonical: null
+
+# --- regularisation ---------------------------------------------------
+# Ridge on *both* within-space covariances, relative to their mean
+# eigenvalue. CCA inverts two covariances rather than one, so it is far
+# more sensitive to a small pilot budget than Procrustes or ridge
+# regression; this is the knob that keeps it usable there. Watch
+# `cca_min_correlation` in the run summary: pinned at ~1 means the fit is
+# interpolating the pilots and the ridge needs raising.
+reg: 1.0e-3
+
+# --- standardisation --------------------------------------------------
+# None. CCA is invariant to any invertible linear map of either space, so
+# whitening it is not merely redundant -- it is a no-op on the solution
+# while still costing an estimated covariance. The class centres itself
+# in `_fit` and re-offsets in `_transform`, so it is correct with no
+# preprocessing at all, and `whiten`/`standard` only add a transform the
+# canonical stage immediately undoes.
+preprocess: none
+
+eps: 1.0e-6
+
+# Rank of the whitening; inert here, since this preset does not whiten.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for the other linear-like maps. CCA inverts two
+# covariances rather than one, so it is the method in the field with the
+# most to lose from a pilot sample that misrepresents either space.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The canonical rank -- the map factorises
+# through it, so k numbers cross the channel. Not `n_components`: with no
+# whitening that knob is inert, and pointing the rate at it would leave
+# this method transmitting d_src while the others were rate-matched.
+rate_key: n_canonical
+
+seed: ${seed}

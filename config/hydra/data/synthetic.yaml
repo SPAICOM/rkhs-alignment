@@ -1,0 +1,24 @@
+# Offline synthetic agents: a shared class-clustered "ground" latent
+# space observed by each agent through its own random angle-preserving
+# map (orthogonal columns x per-agent scale) plus Gaussian noise -- the
+# exact regime where relative representations are approximately shared
+# and the residual misalignment is orthogonal-shaped -- except for the
+# per-agent monotone `power_range` distortion, which no orthogonal or
+# affine map can absorb and which the RKHS residual stage targets.
+#
+# Agents are named agent_00 ... agent_<n_agents-1>; reference them from
+# `pairs` or `receiver` in the main config. The run's `seed` is applied
+# by the loader, so it is not repeated here.
+
+source: synthetic
+n_agents: 42
+n_train: 2000
+n_test: 1000
+n_classes: 20
+ground_dim: 48
+agent_dims: [48, 56, 64, 72, 80, 88, 96, 52, 60, 76, 84, 50, 68, 92, 100, 48, 104, 58, 70, 86, 94, 54, 78, 62, 108, 66, 82, 90, 74, 98, 48, 102, 106, 110, 112, 114, 116, 118, 120, 122, 124, 126]
+scale_range: [0.5, 2.0]
+noise_std: 1.2
+class_sep: 0.8
+anisotropy: 0.6        # per-feature stretch -> imperfect anchor rendering
+power_range: [0.5, 1.6]  # per-agent monotone distortion (non-linearity)

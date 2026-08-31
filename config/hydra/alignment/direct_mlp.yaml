@@ -1,0 +1,49 @@
+# @package alignment
+# Direct MLP baseline (RKA paper, Sec. V / Fig. 3): a small network that
+# learns the whole TX -> RX map with no geometric prior, so it has to
+# discover the rotation and the non-linearity together. The most
+# pilot-hungry method in the comparison.
+
+_target_: src.alignment.DirectMLPAligner
+_convert_: all
+
+# Hidden widths; an int is one layer, a list stacks them. The paper uses
+# a single 16-unit layer for its 12- and 16-dimensional latents. That is a
+# rank-16 bottleneck on 192-1024 dimensional SEMASIA latents, so the
+# baseline is scaled up here to stay a fair comparator; set
+# `hidden_units: 16` to reproduce the paper's exact configuration.
+hidden_units: [512, 256]
+activation: tanh
+alpha: 1.0e-1             # L2 penalty (the paper's regularisation)
+solver: lbfgs             # lbfgs | adam
+max_iter: 1000
+
+preprocess: whiten
+eps: 1.0e-6
+
+# Rank of the whitening: null keeps every direction, an int keeps the top-k
+# principal directions, a float in (0,1] keeps that fraction of variance.
+#
+# This matters more than any other knob on wide encoder latents. Full-rank
+# whitening equalises hundreds of noise directions with the signal ones,
+# and in that many dimensions all pairwise distances concentrate, so the
+# centred RBF Gram matrix degenerates towards the identity: its spectrum
+# is flat, lambda has no smooth subspace to select, and the residual can
+# only interpolate. Measured on a SEMASIA ViT pair at N=359 pilots, the
+# RKA-vs-Procrustes gap is +0.000 at full rank and +0.013 at k=12 -- the
+# paper's own latent dimensionality.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for `rkhs`: the RKA paper's Fig. 3 compares the
+# neural baselines against RKA under its own pilot design, so they share
+# it here.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The whitening rank -- k coefficients on the channel.
+rate_key: n_components
+
+seed: ${seed}

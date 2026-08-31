@@ -1,0 +1,41 @@
+# SEMASIA latents from the Hugging Face Hub (spaicom-lab collection).
+# Only the parquet files of the listed model configs are downloaded.
+#
+# Restricted to the plain ViT family, so architecture is held fixed and
+# what varies across agents is width, patch size and pre-training. Note
+# this no longer holds the pre-training tag constant the way the full
+# 37-encoder list did: `vit_small` is in1k, the two `vit_base` are in21k,
+# and `vit_large` is CLIP/LAION-2B, whose latents render a different
+# semantics rather than a differently-shaped view of the same one.
+# Everything below is already cached locally; the commented block adds
+# in1k-fine-tuned variants that keep the tag constant, at the cost of a
+# download on first use.
+
+source: semasia
+dataset: cifar10
+org: spaicom-lab
+prefix: semasia-
+train_split: train
+test_split: test
+cache_dir: null
+
+# Aligned random subsampling applied after loading (null = all rows).
+# Both left at null: pilots are selected from the whole training split,
+# and every metric is reported over the whole test split rather than a
+# thinned sample of it.
+n_train: null
+n_test: null
+
+# The first entry is the default receiver when `pairs` is left null.
+models:
+  - vit_small_patch16_224.augreg_in1k    # d=384,  in1k
+  - regnety_016.pycls_in1k
+  # - vit_base_patch16_224.augreg_in21k    # d=768,  in21k   (width vs small)
+  # - vit_base_patch32_224.augreg_in21k    # d=768,  in21k   (patch vs base/16)
+  # - vit_large_patch14_clip_224.laion2b   # d=1024, LAION-2B
+  # - vit_tiny_patch16_224.augreg_in21k_ft_in1k
+  # - vit_small_patch16_224.augreg_in21k_ft_in1k
+  # - vit_small_patch32_224.augreg_in21k_ft_in1k
+  # - vit_base_patch16_224.augreg_in21k_ft_in1k
+  # - vit_base_patch32_224.augreg_in21k_ft_in1k
+  # - vit_large_patch16_224.augreg_in21k_ft_in1k

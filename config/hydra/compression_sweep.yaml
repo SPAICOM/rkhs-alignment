@@ -1,0 +1,149 @@
+# Alignment quality against the compression dimension, across encoder pairs.
+#
+# One sweep over the number of transmitted coefficients, run on several
+# deliberately dissimilar encoder pairs, with every method rate-matched at
+# every point. Output is four figures -- one per metric -- rather than a
+# table, because the object of interest is a curve and the metrics
+# disagree about the ranking often enough that collapsing them would lose
+# the finding.
+#
+#   uv run scripts/compression_sweep.py
+#   uv run scripts/compression_sweep.py 'symbols=[4,16,64,256]'
+#   uv run scripts/compression_sweep.py pilots.n_repeats=1     # quick pass
+#   uv run scripts/compression_sweep.py '~methods.kcca'        # drop a method
+#
+# Cost note: the two kernel methods dominate the runtime (an O(N^3) solve
+# each, twice over for KCCA), so a full pass over four pairs is a
+# background job. Trim `symbols` or `pairs` for a quick look.
+
+defaults:
+  - data: semasia
+  # --- the rigid map, in two charts ------------------------------------
+  - alignment@methods.procrustes: procrustes        # truncated whitening
+  - alignment@methods.pga_procrustes: pga_procrustes  # spherical tangent
+  # --- ours, in two charts ---------------------------------------------
+  - alignment@methods.rkhs: rkhs                    # truncated whitening
+  - alignment@methods.pca_rkhs: pca_rkhs            # PCA, unwhitened
+  # --- canonical correlation, three variants ---------------------------
+  - alignment@methods.cca: cca
+  - alignment@methods.svcca: svcca
+  - alignment@methods.kcca: kcca
+  # --- frame-based equalization ----------------------------------------
+  - alignment@methods.ppfe: ppfe
+  - _self_
+
+seed: 42
+
+# --- the rate axis ----------------------------------------------------
+# Transmitted coefficients per sample, written into whichever knob each
+# preset names in `rate_key`. The compression factor against a given
+# transmitter is `symbols / d_src`, so the same grid means different
+# compression on each pair -- which is the point of plotting the
+# dimension rather than the ratio: it is what the channel carries.
+#
+# Two methods cannot always deliver the rate they are asked for, and the
+# figures plot what was realised rather than what was requested:
+#   - a canonical method caps at min(d_src, d_tgt) scores;
+#   - PGA sends one coefficient more than `n_components`, because the
+#     radial coordinate of its polar chart is a real transmitted number.
+symbols: [4, 8, 16, 32, 64, 128, 256]
+
+# --- the pairs, chosen to be as unalike as possible -------------------
+# A rotation explains less of a CNN -> ViT pair than of two ViTs from the
+# same family, which is where a non-linear or non-Euclidean correction
+# has something left to explain. The transmitters span residual CNN,
+# plain CNN, and modern convolutional designs; the last pair repeats a
+# transmitter against a wider receiver to separate "which encoders" from
+# "which widths".
+pairs:
+  - source: resnet50.a1_in1k
+    target: vit_small_patch16_224.augreg_in1k
+    label: ResNet-50 → ViT-S/16
+  - source: vgg16.tv_in1k
+    target: vit_small_patch16_224.augreg_in1k
+    label: VGG-16 → ViT-S/16
+  - source: convnext_base.fb_in1k
+    target: vit_small_patch16_224.augreg_in1k
+    label: ConvNeXt-B → ViT-S/16
+  - source: resnet50.a1_in1k
+    target: vit_base_patch16_224.augreg_in21k
+    label: ResNet-50 → ViT-B/16
+
+# --- calibration ------------------------------------------------------
+# One budget shared by every method and every pair: the same paired
+# samples fit the rigid map and the RKA residual, estimate the canonical
+# bases, and supply the pool PPFE clusters into prototypes. Holding it
+# fixed leaves the rate as the only axis that moves.
+#
+# 3000 clears the capacity requirement at every rate on the grid -- RKA's
+# residual has ~N - k degrees of freedom, so even at k = 256 there are
+# ~2700 left, and the curves are about compression rather than about
+# calibration.
+pilots:
+  n_pilots: 3000
+  # Re-drawn per repeat so the deterministic designs get real error bars.
+  # Must exceed `n_pilots`.
+  pool_size: 12000
+  n_repeats: 2
+  # Used only by a preset that declares no `pilot_strategy` of its own.
+  fallback_strategy: herding
+
+# --- figure -----------------------------------------------------------
+# Eight methods against a four-hue validated palette, so series are
+# folded along a real distinction rather than given invented colours:
+# colour is the method *family* and line style separates its members.
+# Each ablation shares the colour of the method it ablates, which is
+# exactly what makes the pair readable as an ablation.
+hue_of:
+  pga_procrustes: procrustes    # the rigid map in a different chart
+  pca_rkhs: rkhs                # ours without the whitening half of KLT
+  svcca: cca                    # canonical, after an SVD truncation
+  kcca: cca                     # canonical, in an RKHS
+
+# --- receiver decoder -------------------------------------------------
+decoder:
+  enabled: true
+  # The receiver's *fixed* task head. `linear` is TimmDecoder, a ridge
+  # probe mirroring the timm classifier head; its ridge is relative to
+  # the feature Gram, which matters here because a probe fitted without
+  # real regularisation scores transported latents arbitrarily.
+  kind: linear
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+# One figure per metric, in this order. They are not redundant: retrieval
+# asks whether a transported latent lands nearest its own counterpart,
+# accuracy only whether it lands on the right side of a decision
+# boundary, and methods that rank well on one can rank badly on the other.
+eval:
+  metrics: [mrr, top1, top5, accuracy]
+  topk: [1, 5]
+
+output_dir: figures
+plot_title: null
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

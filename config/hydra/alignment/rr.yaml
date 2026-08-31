@@ -1,0 +1,103 @@
+# @package alignment
+# Relative representations with inverse relative projection -- Maiorca et
+# al., "Latent Space Translation via Inverse Relative Projection".
+#
+# The original relative-representation alignment: no prototypes, no
+# Parseval frame. Anchors are raw samples drawn from the training data,
+# the source encodes against its own anchors, and the receiver decodes by
+# pseudo-inverting *its* anchor matrix:
+#
+#   Y_abs = X_rel (A_Y^T)^+ ,   X_rel = X_abs A_X^T
+#
+# Conditioning is handled by refining the anchor set rather than by
+# orthonormalising it, which is what separates this from `ppfe.yaml`:
+#
+#   uv run scripts/evaluate_alignment.py alignment=rr
+#   uv run scripts/evaluate_alignment.py alignment=rr alignment.prune_threshold=0.3
+#
+# See `relative.yaml` for the plain Moschella et al. variant (k-means
+# medoid anchors, Parseval frame) and `ppfe.yaml` for the frame-theoretic
+# equalizer with prototypical anchors.
+
+_target_: src.alignment.RelativeRepresentationAligner
+_convert_: all
+
+# --- anchor set -------------------------------------------------------
+# The paper draws its anchors uniformly at random and starts from k = d
+# of them, which the pruning below then thins. null resolves that to
+# min(d_src, d_tgt), capped at the pilot budget.
+n_anchors: null
+strategy: random
+medoids: false
+anchor_transfer: indices
+n_prototype_samples: null
+
+# --- refinement (Sec. 3.3) --------------------------------------------
+# Anchor pruning: greedy farthest-point sampling under the |cosine|
+# distance, keeping the most mutually orthogonal subset so the
+# pseudo-inverse stops amplifying anchor correlation. This is `delta`,
+# the minimum acceptable distance between kept anchors -- it sets the
+# size of the surviving set rather than a count. null disables pruning.
+#
+# This is the load-bearing knob of the whole method and it has to be
+# retuned per encoder pair, because it is a threshold on an absolute
+# distance whose scale depends on how anisotropic the latents are.
+# Measured on the SEMASIA MNIST vit_base -> vit_small pair at N = 1000
+# (k = 384 anchors, omega = 8), reading kept anchors / cond(P) / MRR:
+#
+#   delta=None   384 / 4.6e9 / 0.001      the pseudo-inverse is unusable
+#   delta=0.2    366 / 2.3e3 / 0.001      barely prunes anything
+#   delta=0.5    153 / 5.7e1 / 0.011
+#   delta=0.7     33 / 8.1e0 / 0.101      best
+#   delta=0.85     8 / 2.6e0 / 0.070      over-pruned: too few anchors left
+#
+# Sweep it before trusting the number on a new pair:
+#   uv run scripts/evaluate_alignment.py -m alignment=rr \
+#       alignment.prune_threshold=0.5,0.7,0.85
+prune_threshold: 0.7
+
+# Anchor subspaces: repeat the pruning with different seeds and average
+# the reconstructions, buying back the coverage aggressive pruning gives
+# up. This is `omega`; the paper finds high omega is what makes a high
+# pruning threshold pay off in the inter-space setting.
+n_subspaces: 8
+
+# --- projection -------------------------------------------------------
+# The paper rescales every latent and anchor to unit norm, so the
+# projection is a cosine similarity; the scale is restored afterwards
+# from the anchor statistics (logged as rr_norm_scale).
+similarity: cosine
+
+# Off by construction: pruning is this paper's conditioning fix, and
+# orthonormalising the frame instead would be `ppfe.yaml`. Watch
+# rr_projector_cond in the run summary to see what the pruning bought.
+parseval: false
+
+decode: pinv
+decode_alpha: 1.0e-2
+
+# Their step (1), "centering and L2 normalization": the centring is here,
+# the L2 normalisation is `similarity: cosine` above.
+preprocess: center
+
+eps: 1.0e-6
+
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Farthest-point sampling. The anchors are drawn from the pilots and the
+# method's own refinement step is itself FPS (under the |cosine|
+# distance), so selecting the pilots the same way hands the pruning a
+# pool that is already well spread instead of asking it to rescue a
+# clustered one. Used whenever the study does not state a pilot strategy
+# of its own.
+pilot_strategy: fps
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The anchor count: one similarity coefficient per
+# anchor is transmitted.
+rate_key: n_anchors
+
+seed: ${seed}

@@ -1,0 +1,59 @@
+# @package alignment
+# PGA-Procrustes: the rigid map fitted in the tangent space of the unit
+# hypersphere, rather than in a whitened Euclidean chart.
+#
+# The premise is that an encoder latent is better described by its
+# *direction* than by its coordinates -- the assumption the whole
+# relative-representation line of work is built on, where cosine
+# similarity is the only thing measured. Principal Geodesic Analysis
+# (Fletcher et al., 2004) is the intrinsic version of PCA for that
+# geometry: Frechet mean, Log map to the tangent space there, ordinary
+# PCA in that flat space, Exp map to invert.
+#
+# Read against `procrustes` this is an ablation of the chart, holding the
+# rigid map fixed: same Q, same rate, different notion of "the leading
+# directions of a latent space".
+#
+# Two consequences to know before reading a rate-matched table:
+#
+#   - The realised rate is `n_components + 1`. The chart is polar,
+#     R+ x S^(d-1), so the radius rides along as a real transmitted
+#     coefficient. `symbols` writes into `n_components`, so this method
+#     sends one number more than the others at nominally the same
+#     setting; the `symbols` column reports what actually crossed.
+#   - Tangent vectors are orthogonal to the mean by construction, so the
+#     tangent space has only d - 1 usable dimensions and the rank caps
+#     there.
+#
+#   uv run scripts/compression_sweep.py
+#   uv run scripts/evaluate_alignment.py alignment=pga_procrustes
+
+_target_: src.alignment.ProcrustesAligner
+_convert_: all
+
+# Frechet mean, Log map, PCA in the tangent space; Exp to invert. Note
+# this is *not* a linear preprocessing, so the composed map is no longer
+# affine even though the aligned stage is still a rigid rotation.
+preprocess: pga
+
+# Redundant under any chart that removes global scale, and the polar
+# chart carries the radius explicitly.
+scaling: false
+
+# Unused by this chart: centring is intrinsic (the Frechet mean is the
+# origin) and nothing is inverted, so there is no covariance ridge.
+eps: 1.0e-6
+
+# The tangent rank, and the rate; see the note above on the extra radial
+# coefficient.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for `procrustes`: the cross-covariance still wants a
+# pilot sample that represents the pool.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+rate_key: n_components
+
+seed: ${seed}

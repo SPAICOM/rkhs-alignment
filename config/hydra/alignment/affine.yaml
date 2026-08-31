@@ -1,0 +1,48 @@
+# @package alignment
+# The `affine` class of Maiorca et al., "Latent Space Translation via
+# Semantic Alignment" (Sec. 3.2): T(x) = Rx + b, the broadest
+# transformation class they consider.
+#
+# Caveat worth knowing before reading the results table: under the
+# paper's own standard scaling both spaces are centred, so the
+# least-squares intercept is exactly zero and this coincides with
+# `linear`. The paper reports them separately because it fits the affine
+# map by gradient descent rather than in closed form, which lands on a
+# slightly different point. Keep the row for completeness, and expect it
+# to track `linear` to several decimals.
+
+_target_: src.alignment.LinearAligner
+_convert_: all
+
+fit_intercept: true
+orthogonalize: false
+
+# --- regularisation ---------------------------------------------------
+# Ridge strength, relative to the trace of the source Gram matrix (so it
+# is invariant to the latent scale). The paper solves unregularised least
+# squares; this is the smallest ridge that keeps the solve stable.
+alpha: 1.0e-6
+
+# Whitened, matching `linear.yaml`, `l_ortho.yaml` and `procrustes.yaml`,
+# so the paper's four transformation classes differ only in the
+# constraint on T. (The paper standard-scales; for the affine and linear
+# classes the two choices land within 0.001 MRR of each other, unlike
+# l-ortho, where it decides the result.)
+preprocess: whiten
+
+eps: 1.0e-6
+
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for `linear` -- the two differ only in the
+# intercept, so they share a calibration design.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The whitening rank -- k coefficients on the channel.
+rate_key: n_components
+
+seed: ${seed}

@@ -1,0 +1,157 @@
+# Post-alignment performance against the compression factor.
+#
+# One fixed encoder pair, five equalizers, the rate on the x-axis. This is
+# the definitive rate–distortion study: every method is asked to deliver
+# the receiver's semantics from the same number of transmitted
+# coefficients, and what varies is the mechanism that spends them.
+#
+#   uv run scripts/compression_study.py
+#   uv run scripts/compression_study.py 'symbols=[8,16,32,64]'
+#   uv run scripts/compression_study.py pilots.n_repeats=4
+#
+# Two costs are separated deliberately and must not be conflated:
+#   symbols        the RATE -- coefficients per sample, paid on every
+#                  transmission, for ever. Compression is symbols/d_src.
+#   pilots.counts  the CALIBRATION budget -- paired samples exchanged
+#                  once, before the link carries anything.
+
+defaults:
+  - data: semasia
+  - alignment@methods.procrustes: procrustes
+  - alignment@methods.cca: cca
+  - alignment@methods.svcca: svcca
+  - alignment@methods.rkhs: rkhs
+  - alignment@methods.ppfe: ppfe
+  - _self_
+
+seed: 42
+
+# --- the pair, held fixed ---------------------------------------------
+# ResNet-50 -> ViT-S: a CNN transmitter and a ViT receiver, chosen because
+# a cross-architecture pair leaves more for a non-linear correction to
+# explain than two ViTs of the same family do. d_src = 2048, d_tgt = 384.
+pairs:
+  - source: resnet50.a1_in1k
+    target: vit_small_patch16_224.augreg_in1k
+receiver: null
+max_pairs: 1
+
+# --- the rate axis ----------------------------------------------------
+# Transmitted coefficients per sample. Written into whichever knob each
+# preset names in `rate_key`: `n_components` for the Karhunen-Loeve pair
+# (the whitening keeps k principal directions, so k numbers are sent),
+# `n_canonical` for the two canonical methods, `n_anchors` for PPFE.
+#
+# Every rate here is comfortably inside the capacity the 3000-pilot budget
+# provides, which is the point of choosing that budget: the curve is then
+# about compression alone. Watch the `capacity` column anyway -- it is
+# ~N - k, and were it to reach zero the constraint G X^T = 0 would admit
+# only G = 0 and RKA would return Procrustes silently, with no error.
+symbols: [8, 16, 32, 64, 128, 256, 512]
+
+# --- the calibration axis ---------------------------------------------
+pilots:
+  # One budget, shared by every method: the same 3000 paired samples fit
+  # the Procrustes rotation and the RKA residual, estimate both canonical
+  # bases, and supply the pool PPFE clusters into its prototypes. Holding
+  # it fixed isolates the rate as the only axis that varies.
+  #
+  # 3000 clears the capacity requirement at every rate on the grid --
+  # RKA's residual has ~N - k degrees of freedom, so even at k = 512
+  # there are ~2487 left — which is what makes this the budget at which
+  # the rate curve is about compression rather than about calibration.
+  counts: [3000]
+
+  # With a single budget nothing is swept over it; the key is kept
+  # because a multi-budget run is a one-line change and PPFE has no free
+  # calibration budget of its own to sweep (its anchor count is pinned by
+  # the rate). Note its *paired* cost is still the whole pool: a
+  # prototypical anchor is a mean over its cluster, so both agents must
+  # embed every pilot that enters one.
+  sweep_methods: [procrustes, cca, svcca, rkhs]
+
+  # Re-drawn per repeat so the deterministic designs (herding, k-means
+  # over a fixed pool) get real error bars instead of a spread of exactly
+  # zero. Must exceed the largest entry of `counts`.
+  pool_size: 12000
+  n_repeats: 3
+
+  # Used only by a preset that declares no `pilot_strategy` of its own.
+  fallback_strategy: herding
+
+# --- method overrides -------------------------------------------------
+# The four methods split cleanly by how they buy their rate, and the
+# presets already encode it, so nothing here has to force it:
+#
+#   procrustes, rkhs   truncated whitening (Karhunen-Loeve). The
+#                      transmitter sends k principal coordinates, so
+#                      `n_components` is both the compression and the
+#                      denoising, and it is what `symbols` writes into.
+#   cca, svcca         no preprocessing at all. CCA is invariant to any
+#                      invertible linear map of either space, so whitening
+#                      it would be a no-op on the solution; the rate is
+#                      the canonical rank `n_canonical` instead. SVCCA
+#                      truncates with its own per-space SVD levels, which
+#                      buy accuracy rather than airtime.
+#   ppfe               one frame coefficient per anchor, `n_anchors`.
+#
+# A ceiling worth reading off the results rather than being surprised by:
+# no canonical method can exceed min(d_src, d_tgt) = 384 pairs on this
+# pair, so at `symbols: 512` cca and svcca report a *realised* rate of
+# 384 while the other three reach 512.
+methods:
+  # The bandwidth measured best on this pair; see alignment/rkhs.yaml.
+  rkhs:
+    bandwidth_scale: 0.5
+    lam_grid: null
+    lam: 1.0e-3
+
+# --- receiver decoder -------------------------------------------------
+decoder:
+  enabled: true
+  kind: linear
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+# MRR first: post-alignment accuracy saturates on these pairs and cannot
+# separate the methods, while retrieval can.
+eval:
+  metrics: [mrr, accuracy]
+  topk: [1, 5]
+
+# --- figure -----------------------------------------------------------
+# The validated palette carries four hues and there are five methods, so
+# one series is folded rather than a fifth hue invented. `svcca` shares
+# `cca`'s colour and is separated by line style, which states something
+# true: they are one family differing by a per-space SVD truncation.
+hue_of:
+  svcca: cca
+
+output_dir: figures
+plot_title: null
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

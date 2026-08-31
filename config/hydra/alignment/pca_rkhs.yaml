@@ -1,0 +1,80 @@
+# @package alignment
+# PCA-RKA: Residual Kernel Alignment on a PCA-reduced latent, with the
+# whitening replaced by a plain rotation onto the leading principal axes.
+#
+# Read against `rkhs` this is an ablation of the chart, holding the map
+# fixed. The Karhunen-Loeve step does two things at once -- it discards
+# the trailing directions, and it rescales the retained ones to equal
+# variance -- and this preset does only the first, which isolates which
+# half the method is living on.
+#
+# It is not obvious which way it should go:
+#   - Whitening is what licenses the isometry. Procrustes minimises
+#     ||X Q^T - Y|| over semi-orthogonal Q, which is the right model only
+#     once both spaces have identity covariance; on merely rotated data a
+#     rigid map cannot absorb a variance mismatch between matched
+#     directions, so the rigid stage should lose something here.
+#   - The kernel stage may gain. Whitening equalises every retained
+#     direction, so an RBF distance weights a high-variance semantic axis
+#     exactly like a low-variance one; under PCA the leading axes keep
+#     their scale and dominate the distance, which is arguably the
+#     geometry the residual should be measured in.
+#
+#   uv run scripts/compression_sweep.py
+#   uv run scripts/evaluate_alignment.py alignment=pca_rkhs
+
+_target_: src.alignment.RKHSAligner
+_convert_: all
+
+# --- kernel -----------------------------------------------------------
+kernel: rbf
+gamma: null
+# The median-distance heuristic is now measured on an un-whitened cloud
+# whose directions differ in scale by orders of magnitude, so the
+# bandwidth that suited the whitened geometry need not suit this one:
+#   uv run scripts/kernel_study.py aligner.preprocess=pca
+bandwidth_scale: 1.0
+degree: 3
+coef0: 1.0
+
+# --- regularisation ---------------------------------------------------
+lam: 1.0e-3
+lam_grid:
+  - 1.0e-6
+  - 1.0e-5
+  - 1.0e-4
+  - 1.0e-3
+  - 1.0e-2
+  - 1.0e-1
+  - 1.0
+  - 1.0e+1
+  - 1.0e+2
+  - 1.0e+3
+val_fraction: 0.2
+selection: nmse
+
+# --- pipeline switches ------------------------------------------------
+center_kernel: true
+orthogonal_residual: true
+ridge_B: 1.0e-8
+max_points: 4000
+
+# --- standardisation --------------------------------------------------
+# Centre and rotate onto the top-k principal axes, keeping their
+# variances. Orthonormal columns, so the transform is its own inverse on
+# the retained subspace: no ridge, no shrinkage, nothing inverted.
+preprocess: pca
+
+eps: 1.0e-6
+
+# The retained rank, and the rate -- `symbols` writes here exactly as it
+# does for `rkhs`, so the two are rate-matched by construction.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+rate_key: n_components
+
+seed: ${seed}

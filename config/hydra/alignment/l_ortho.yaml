@@ -1,0 +1,58 @@
+# @package alignment
+# The `l-ortho` class of Maiorca et al., "Latent Space Translation via
+# Semantic Alignment" (Sec. 3.2): solve the unconstrained least-squares
+# map, then project it onto the closest orthogonal matrix by SVD.
+#
+# This is deliberately *not* Procrustes. Procrustes optimises over the
+# orthogonal group directly; this one orthogonalises after the fact, so
+# reading the two side by side says how nearly orthogonal the
+# unconstrained solution already was. `linear_orthogonality` in the run
+# summary reports that directly: 1.0 means the least-squares fit was
+# already an isometry and the projection cost nothing.
+
+_target_: src.alignment.LinearAligner
+_convert_: all
+
+fit_intercept: false
+orthogonalize: true
+
+alpha: 1.0e-6
+
+# The paper standard-scales; this preset whitens, matching `linear.yaml`
+# and `procrustes.yaml` so that the paper's four transformation classes
+# differ only in the constraint on T and not in their pre-processing.
+# That is not cosmetic here. Measured on the SEMASIA MNIST
+# vit_base -> vit_small pair at N = 1000 pilots:
+#
+#              linear_orthogonality   MRR      (linear baseline: 0.377)
+#   standard   0.59                   0.005    orthogonalisation destroys it
+#   whiten     0.82                   0.409    orthogonalisation helps
+#
+# The paper's own claim -- that least squares converges to an R which is
+# almost orthogonal, so l-ortho costs little -- only holds in whitened
+# coordinates. Under standard scaling the fit is far from an isometry,
+# and flattening its singular values to 1 amplifies the noise directions
+# it had correctly shrunk.
+preprocess: whiten
+
+eps: 1.0e-6
+
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for `linear`. This class needs a representative
+# sample more than the fit it is derived from does: flattening the
+# singular values gives the poorly-estimated directions the same weight
+# as the well-estimated ones, so whatever the least-squares solution got
+# wrong is amplified rather than shrunk. Farthest-point sampling costs it
+# ~16 accuracy points on the pair measured in procrustes.yaml, the
+# second-largest such loss in the field after Procrustes' own.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The whitening rank -- k coefficients on the channel.
+rate_key: n_components
+
+seed: ${seed}

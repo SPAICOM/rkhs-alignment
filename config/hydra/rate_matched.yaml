@@ -1,0 +1,116 @@
+# Three equalizers at one channel rate: PPFE, Procrustes, RKA.
+#
+# The comparison the semantic-communication framing actually calls for.
+# Every method here compresses the semantic message; they just buy the
+# compression with different objects, and the point of this study is to
+# hold the *rate* fixed and let the mechanism vary:
+#
+#   ppfe        transmits c = F x, one coefficient per anchor, so the
+#               anchor count is the rate. The receiver synthesises with
+#               its own Parseval frame -- zero-shot, nothing fitted.
+#   procrustes  transmits the truncated whitened latent, k coefficients,
+#               and the receiver applies one rigid rotation.
+#   rkhs        the same k coefficients, and the receiver applies the
+#               rotation plus a kernel correction fitted on the pilots.
+#
+# `symbols` writes itself into whichever knob each preset names in
+# `rate_key` -- `n_anchors` for PPFE, `n_components` for the other two --
+# so a single number rate-matches the field. The realised rate comes back
+# in the `symbols` column of the results table; check it agrees.
+#
+#   uv run scripts/method_comparison.py --config-name=rate_matched
+#   uv run scripts/method_comparison.py --config-name=rate_matched symbols=96
+#   uv run scripts/method_comparison.py --config-name=rate_matched -m \
+#       symbols=12,24,48,96,192,384
+#
+# The last form is the rate-distortion sweep: post-alignment performance
+# against the number of symbols spent, which is the curve the frame-based
+# equalization literature reports (their compression factor is the same
+# quantity, normalised by the uncompressed latent).
+
+defaults:
+  - data: semasia
+  - alignment@methods.ppfe: ppfe
+  - alignment@methods.procrustes: procrustes
+  - alignment@methods.rkhs: rkhs
+  - _self_
+
+seed: 42
+
+# --- the channel rate, shared by all three ----------------------------
+# 48 is where RKA led on the resnet50 -> vit_small pair; the lead is
+# rank-dependent (it reverses by 96), so sweep this rather than trusting
+# one value.
+symbols: 48
+
+highlight: rkhs
+
+# --- encoder pairs ----------------------------------------------------
+# A cross-architecture pair by default: a CNN transmitter and a ViT
+# receiver have less in common than two ViTs, which is where a non-linear
+# correction has something left to explain.
+pairs:
+  - source: resnet50.a1_in1k
+    target: vit_small_patch16_224.augreg_in1k
+receiver: null
+max_pairs: 4
+
+# --- the fixed calibration budget -------------------------------------
+# Truncating the whitening to k relaxes this a long way. RKA's residual
+# has rank(K) - rank(X) degrees of freedom, and truncation drops rank(X)
+# from d_src to `symbols` -- so the budget has to clear roughly twice
+# `symbols`, not twice the raw latent dimension. At symbols=48 that is
+# ~100 pilots rather than ~4096 for a 2048-dimensional transmitter.
+#
+# 1536 is kept here because the anchors PPFE needs are drawn from the
+# same pilots and a larger pool gives k-means better prototypes; lower it
+# freely to study the low-budget regime, which is where the three methods
+# should separate most.
+pilots:
+  n_pilots: 1536
+  strategy: null              # null -> each preset's own `pilot_strategy`
+  fallback_strategy: herding
+  n_repeats: 1
+
+# --- receiver decoder -------------------------------------------------
+decoder:
+  enabled: true
+  kind: linear
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+# MRR first: on these pairs the probe accuracy saturates and cannot
+# separate the methods, while retrieval can. The ranking follows the
+# first entry.
+eval:
+  metrics: [mrr, accuracy]
+  topk: [1, 5]
+
+output_dir: figures
+plot_title: null
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

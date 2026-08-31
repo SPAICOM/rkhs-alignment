@@ -1,0 +1,65 @@
+# @package alignment
+# Orthogonal Procrustes: one rigid (semi-orthogonal) map between the two
+# whitened latent spaces. Rectangular whenever the encoders disagree on
+# dimension. This is the classic "Ortho" baseline and the lam -> inf
+# limit of the RKHS method.
+
+_target_: src.alignment.ProcrustesAligner
+_convert_: all
+
+# Per-space standardisation fitted on the calibration split:
+#   none | center | standard | pca | pga | whiten
+preprocess: whiten
+
+# Also fit the optimal isotropic scale. Redundant under `whiten`, which
+# already removes any global scale difference.
+scaling: false
+
+# Relative covariance ridge of the whitening step.
+eps: 1.0e-6
+
+# Rank of the whitening: null keeps every direction, an int keeps the top-k
+# principal directions, a float in (0,1] keeps that fraction of variance.
+#
+# This matters more than any other knob on wide encoder latents. Full-rank
+# whitening equalises hundreds of noise directions with the signal ones,
+# and in that many dimensions all pairwise distances concentrate, so the
+# centred RBF Gram matrix degenerates towards the identity: its spectrum
+# is flat, lambda has no smooth subspace to select, and the residual can
+# only interpolate. Measured on a SEMASIA ViT pair at N=359 pilots, the
+# RKA-vs-Procrustes gap is +0.000 at full rank and +0.013 at k=12 -- the
+# paper's own latent dimensionality.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding: greedily pick the pilot set whose kernel mean embedding
+# best matches the full pool's. The rigid map is fitted from a cross-
+# covariance, so what it needs from its pilots is a sample that
+# *represents the distribution* -- and a mean-embedding match is exactly
+# that criterion. Used whenever the study does not state a pilot strategy
+# of its own.
+#
+# Farthest-point sampling looks like the natural alternative -- spread is
+# what pins down a rotation -- but it selects extremes rather than
+# representatives, and this method has no ridge to absorb them. Measured
+# on the SEMASIA MNIST vit_base -> vit_small pair at N = 1536, with the
+# mean centred norm of the selected pilots against the pool's 38.2:
+#
+#              mean |z|   accuracy   MRR
+#   herding    38.2       0.917      0.459
+#   random     38.2       0.872      0.358
+#   kmeans     37.2       0.867      0.328
+#   fps        48.5       0.481      0.076   <- outlier-dominated
+#
+# The regularised linear maps are far more tolerant of the same pilots
+# (0.925 vs 0.939 under fps), so the loss shows up here first and worst.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The whitening rank: the transmitter sends its
+# truncated whitened latent, so k coefficients go on the channel.
+rate_key: n_components
+
+seed: ${seed}

@@ -1,0 +1,61 @@
+# @package alignment
+# Unconstrained ridge-regularised linear map -- the `linear` class of
+# Maiorca et al., "Latent Space Translation via Semantic Alignment"
+# (least squares with b = 0). Useful as the ceiling of what any purely
+# linear method can reach on a given encoder pair: if the RKHS residual
+# does not beat it, whatever Procrustes was missing was linear structure
+# all along.
+#
+# Its two siblings from the same paper have their own presets:
+#   alignment=affine    T(x) = Rx + b     (fit_intercept: true)
+#   alignment=l_ortho   SVD-orthogonalised R  (orthogonalize: true)
+# and their fourth class, `ortho`, is alignment=procrustes.
+
+_target_: src.alignment.LinearAligner
+_convert_: all
+
+# Note this preset whitens, where the paper standardises: whitening is
+# the repo-wide default that makes the linear baseline directly
+# comparable with Procrustes and RKA. `affine.yaml` and `l_ortho.yaml`
+# use the paper's `standard` instead.
+preprocess: whiten
+
+# --- regularisation ---------------------------------------------------
+# Ridge strength, relative to the trace of the source Gram matrix (so it
+# is invariant to the latent scale).
+alpha: 1.0e-6
+
+fit_intercept: false      # true -> the `affine` class
+orthogonalize: false      # true -> the `l-ortho` class
+
+eps: 1.0e-6
+
+# Rank of the whitening: null keeps every direction, an int keeps the top-k
+# principal directions, a float in (0,1] keeps that fraction of variance.
+#
+# This matters more than any other knob on wide encoder latents. Full-rank
+# whitening equalises hundreds of noise directions with the signal ones,
+# and in that many dimensions all pairwise distances concentrate, so the
+# centred RBF Gram matrix degenerates towards the identity: its spectrum
+# is flat, lambda has no smooth subspace to select, and the residual can
+# only interpolate. Measured on a SEMASIA ViT pair at N=359 pilots, the
+# RKA-vs-Procrustes gap is +0.000 at full rank and +0.013 at k=12 -- the
+# paper's own latent dimensionality.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+# Kernel herding, as for the other linear-like maps: a least-squares fit
+# is only as good as the sample its design matrix is drawn from, and
+# herding matches that sample to the pool in the mean-embedding sense.
+# Farthest-point sampling costs this method ~1.5 accuracy points on the
+# pair measured in procrustes.yaml -- little, because the ridge absorbs
+# the outliers FPS selects, but there is nothing to gain either.
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The whitening rank -- k coefficients on the channel.
+rate_key: n_components
+
+seed: ${seed}

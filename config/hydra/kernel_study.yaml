@@ -1,0 +1,139 @@
+# Which kernel explains the Procrustes residual, and at what bandwidth?
+#
+# The kernel is the modelling choice RKA rests on, so this study measures
+# it against its own job description -- `residual_r2`, the fraction of the
+# *held-out* Procrustes residual the correction explains -- rather than
+# through the downstream metric, which on a saturated pair cannot resolve
+# the difference between a kernel that works and one that does nothing.
+#
+#   uv run scripts/kernel_study.py                    # kernel x bandwidth
+#   uv run scripts/kernel_study.py sweep=pilots       # herding bandwidth
+#   uv run scripts/kernel_study.py data=semasia_mnist pilots.n_pilots=1536
+#   uv run scripts/kernel_study.py 'kernels=[rbf,laplacian]'
+
+defaults:
+  - data: semasia
+  - _self_
+
+seed: 42
+
+# `kernel` sweeps the residual stage's own kernel; `pilots` sweeps the
+# bandwidth of the herding kernel that chooses the calibration set,
+# holding the aligner fixed.
+sweep: kernel                 # kernel | pilots
+
+# --- encoder pairs ----------------------------------------------------
+pairs: null
+receiver: null
+max_pairs: 2
+
+# --- the residual-stage sweep -----------------------------------------
+# `linear` and `cosine` are included deliberately and are expected to
+# score ~0: their RKHS *is* the space of linear functions, which is
+# exactly what the constraint G X^T = 0 removes, so the fit has no
+# degrees of freedom left. The `capacity` column reports that directly
+# (rank(K) - rank(X)), turning a puzzling flat line into a stated fact.
+kernels: [rbf, laplacian, polynomial, linear, cosine]
+
+# Multiplier on the median-heuristic bandwidth: > 1 smooths, < 1
+# sharpens. The heuristic is a starting point, not an answer -- it is
+# computed on the whitened source cloud and knows nothing about the
+# residual it will be asked to model.
+#
+# Only `rbf` and `laplacian` respond to it: the median heuristic is what
+# it scales, and `Kernel.fit` runs that heuristic for those two families
+# alone. `polynomial` therefore repeats the same row at every scale (its
+# shape is set by `degree` and `coef0`), and `linear`/`cosine` have no
+# bandwidth at all. That is why their curves are flat, not a bug.
+bandwidth_scales: [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0]
+
+# --- the pilot-design sweep (sweep=pilots) ----------------------------
+# Kernel herding picks the subset whose mean embedding best matches the
+# pool's, and how local that match is depends entirely on the bandwidth.
+# The RKA paper's argument is that pilots should be chosen in the *same*
+# RKHS the residual is then fitted in; nothing in the pipeline enforces
+# that, and `select_pilots` defaults to a plain median-heuristic RBF, so
+# this sweep is what says whether matching them is worth anything.
+pilot_kernel: rbf
+pilot_bandwidth_scales: [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0]
+
+# --- the aligner held fixed across the sweep --------------------------
+# Everything except the swept knob. Kept flat rather than composed from
+# `alignment/rkhs.yaml` so the study cannot silently inherit a change to
+# that preset mid-experiment.
+aligner:
+  # The residual stage's own kernel. `sweep: kernel` overrides both of
+  # these; `sweep: pilots` holds them here, which is what lets that sweep
+  # ask the real question -- whether the *selection* kernel should match
+  # the one the residual is fitted in.
+  #
+  # bandwidth_scale 0.5 rather than the preset's 1.0: measured on the
+  # CIFAR-10 resnet50 -> vit_small pair at k=48, the held-out residual
+  # R^2 peaks there (0.0289 against 0.0245 at 1.0), and both downstream
+  # metrics peak with it. The median heuristic is a starting point, not
+  # an answer.
+  kernel: rbf
+  bandwidth_scale: 0.5
+  gamma: null                 # null -> median heuristic x bandwidth_scale
+  degree: 3
+  coef0: 1.0
+  lam: 1.0e-3
+  lam_grid: null              # fixed lam, so the kernel is the only variable
+  val_fraction: 0.2
+  selection: nmse
+  center_kernel: true
+  orthogonal_residual: true
+  ridge_B: 1.0e-8
+  max_points: 4000
+  preprocess: whiten
+  eps: 1.0e-6
+  # Truncating the whitening is what gives the residual a spectrum to
+  # work with; at full rank the centred Gram matrix degenerates towards
+  # the identity and every kernel looks equally useless.
+  n_components: 96
+
+# --- calibration ------------------------------------------------------
+pilots:
+  n_pilots: 1536
+  strategy: herding           # used by sweep=kernel; sweep=pilots re-selects
+
+# --- receiver decoder -------------------------------------------------
+decoder:
+  enabled: true
+  kind: linear
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+eval:
+  # `residual_r2` is always the first panel and is added automatically.
+  metrics: [mrr, accuracy]
+  topk: [1, 5]
+
+output_dir: figures
+plot_title: null
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false
