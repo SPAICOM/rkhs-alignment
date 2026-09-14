@@ -48,7 +48,28 @@ gamma: null               # null -> the `bandwidth` heuristic below
 # The paper's width is coordinatewise (sigma_l = sqrt(10 S_l)), i.e. an
 # anisotropic kernel; the isotropic reduction used here coincides with it
 # exactly under `preprocess: standard`, which is why that is the default.
-bandwidth: rule_of_thumb
+#
+# `median` rather than the paper's rule, because the paper's rule is
+# blind to the dimension and these latents are far wider than the ones it
+# was written for. It fixes sigma^2 = 10 regardless of d, while the
+# median squared distance between standardised points grows as 2d, so the
+# typical kernel entry decays as exp(-d/10):
+#
+#     d       gamma    median ||x-y||^2    typical k(x, y)
+#     8       0.050                14.7          4.8e-01
+#     128     0.050               254.8          2.9e-06
+#     512     0.050              1026.5          5.4e-23
+#     2048    0.050              4098.7          7.3e-90
+#
+# Past d ~ 512 every off-diagonal entry underflows, the Gram matrix
+# becomes the identity, and no test point sees any pilot: the map
+# collapses to a constant and scores exactly at chance (MRR 0.0010,
+# accuracy 0.1000, one unique output row for all 10000 test points).
+# On resnet50 -> vit_small at k = 256, switching to `median` moved it
+# from that to MRR 0.4626 / accuracy 0.8836. Set `rule_of_thumb` back
+# for latents narrow enough to be in its regime, or to reproduce the
+# paper on its own scale.
+bandwidth: median
 bandwidth_scale: 1.0      # >1 smooths, <1 sharpens
 
 degree: 3                 # polynomial kernel only
@@ -158,11 +179,22 @@ readout_reg: 1.0e-6
 max_points: 2000
 
 # --- standardisation --------------------------------------------------
-# Unlike CCA this method is *not* invariant to a change of basis -- the
-# kernel sees the coordinates -- so `none` is not an option the way it is
-# in `cca.yaml`. z-scoring is what makes the paper's coordinatewise
-# window width exact.
-preprocess: standard
+# `none`, matching `cca.yaml` and `svcca.yaml`, so the canonical family
+# is compared on one footing.
+#
+# The argument against it does not survive measurement. Unlike CCA this
+# method is genuinely *not* invariant to a change of basis -- the kernel
+# sees the coordinates -- so z-scoring is not the no-op here that it is
+# in `cca.yaml`, and it is what made the paper's coordinatewise window
+# width exact. But that reasoning assumed the paper's `rule_of_thumb`
+# width, which is not what is used above: the `median` heuristic rescales
+# itself to whatever spread the coordinates actually have, so the one
+# thing standardisation was protecting is already handled. Measured on
+# resnet50 -> vit_small at k = 256, `none` beats `standard` on MRR
+# (0.5472 vs 0.4626) and on accuracy (0.8914 vs 0.8836), and the two are
+# within noise at k = 16. Set `standard` to reproduce the paper's
+# window width exactly.
+preprocess: none
 eps: 1.0e-6
 n_components: null
 

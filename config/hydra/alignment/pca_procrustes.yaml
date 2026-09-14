@@ -1,0 +1,44 @@
+# @package alignment
+# Procrustes on a PCA-reduced latent: the rigid half of `pca_rkhs`, on
+# the same chart.
+#
+# This is the reference `pca_rkhs` has to be read against, and the reason
+# is structural rather than stylistic. RKA is Procrustes plus a
+# constrained RKHS residual, so as `lambda` grows the residual vanishes
+# (A* -> 0) and the map converges to `Q*x` -- but to *this* `Q*`, the one
+# fitted on the same chart. Reading the sweep against the whitened
+# `procrustes` preset instead compares two charts at once, and the
+# lambda -> infinity limit then lands somewhere the curve can never reach,
+# which reads as a failure of the residual stage when it is nothing of
+# the kind.
+#
+# The chart matters most for the retrieval metrics: whitening equalises
+# every retained direction, so a cosine distance weights them alike,
+# while PCA keeps the raw variances and lets the leading axes dominate.
+# That is a real difference between the two preprocessings, and it
+# belongs in the compression/ablation studies -- not smuggled into a
+# regularisation sweep as if it were the residual's doing.
+#
+#   uv run scripts/lambda_sweep.py
+#   uv run scripts/evaluate_alignment.py alignment=pca_procrustes
+
+_target_: src.alignment.ProcrustesAligner
+_convert_: all
+
+# The only line that differs from `procrustes`: the chart.
+preprocess: pca
+
+scaling: false
+eps: 1.0e-6
+
+# Rate-matched to `pca_rkhs` through `rate_key`, so both stages see the
+# same number of symbols.
+n_components: null
+
+# --- pilot design -----------------------------------------------------
+pilot_strategy: herding
+
+# --- channel rate -----------------------------------------------------
+rate_key: n_components
+
+seed: ${seed}

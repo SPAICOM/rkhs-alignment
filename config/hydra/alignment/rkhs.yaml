@@ -70,6 +70,41 @@ lam_grid:
 val_fraction: 0.2
 selection: nmse           # nmse | cosine
 
+# Units of `lam`. In the shift `s_i + N*lam` the Gram eigenvalues carry
+# the kernel's scale and `lam` does not, so rescaling k -> c*k -- which
+# leaves the hypothesis space untouched and only relabels its norm --
+# multiplies every s_i by c, and one fixed grid then means something
+# different for every kernel and every bandwidth. Mean eigenvalue of the
+# centred Gram on whitened d=48 pilots, N=400:
+#
+#   rbf 0.63 | laplacian 0.63 | cosine 1.0 | linear 48 | poly 1.3e5
+#
+# so the grid below, topping out at 1e3, never regularises the polynomial
+# kernel at all (its top mode needs lam ~ 1.8e3) -- it only ever
+# interpolates, which is a sufficient explanation for the -0.041 recorded
+# under `kernel` above. `bandwidth_scale` does the same thing more mildly:
+# the mean eigenvalue moves 16x from scale 0.25 to 16, dragging the lambda
+# axis under any joint sweep.
+#
+# `trace` divides that constant out by the mean non-zero eigenvalue, so
+# the objective becomes
+#
+#   (1/N)||E - G||_F^2 + lam * s_mean * ||g||_H^2
+#
+# with `lam` dimensionless. It reparametrises the same one-parameter path
+# rather than changing the model: every fit stays reachable, at
+# lam / s_mean. For RBF at the median bandwidth s_mean ~ 0.63, so values
+# here move by ~0.2 decades against the old convention -- but results
+# cached under `n` are on a different axis, so re-run rather than resume
+# across the switch.
+#
+# What it does NOT fix is the drift of the best lam with the pilot budget:
+# under distance concentration the Gram spectrum flattens, every
+# eigenvalue sits near s_mean and shrinkage bites at lam ~ 1/N. Read
+# `rkhs_gram_flatness` (s_max/s_mean, -> 1 is bad) and compare budgets on
+# effective degrees of freedom, not on lam.
+lam_scaling: trace        # n | trace
+
 # --- pipeline switches ------------------------------------------------
 # Double-centre the Gram matrix. Keep this on: the model has no intercept
 # in feature space, so without it the RKHS term absorbs a constant offset
@@ -89,7 +124,7 @@ ridge_B: 1.0e-8
 # Needed because the SEMASIA data configs no longer thin the training
 # split: handed all 50k rows, the exact solve would want a 50000x50000
 # Gram matrix. Pilot budgets stay far below this, so it never binds there.
-max_points: 4000
+max_points: 24000
 
 # --- standardisation --------------------------------------------------
 preprocess: whiten        # Step 0 of the pipeline

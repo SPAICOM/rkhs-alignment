@@ -174,14 +174,91 @@ def evaluate(
     return scores
 
 
+def merge_summary(
+    path: Path, fresh: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Fold ``fresh`` into the summary already at ``path``.
+
+    A row is keyed by (pair, method, requested_symbols). Rows for a
+    method that was just run replace whatever was there; rows for every
+    other method are carried through untouched. This is what makes a
+    partial rerun safe -- correcting one method's configuration costs
+    only that method's fits, and the rest of the table survives.
+
+    Only methods are keyed on, not pairs: a method rerun on a subset of
+    pairs would otherwise leave its stale rows for the remaining pairs
+    silently mixed in with fresh ones.
+    """
+    if not path.exists() or not fresh:
+        return fresh
+
+    rerun = {row['method'] for row in fresh}
+    with path.open(newline='') as handle:
+        previous = [
+            r for r in csv.DictReader(handle) if r['method'] not in rerun
+        ]
+    if not previous:
+        return fresh
+
+    # The stored CSV is all strings; restore each column to the type the
+    # fresh rows use, so the plotting code sees one consistent table and
+    # the rewritten CSV does not end up with `4` on some rows and `4.0`
+    # on others. Rate columns are counts and have to stay counts.
+    kinds = {
+        k: type(v) for k, v in fresh[0].items() if isinstance(v, (int, float))
+    }
+    for row in previous:
+        for key, kind in kinds.items():
+            if key in row:
+                value = float(row[key])
+                row[key] = value if kind is float else kind(value)
+
+    kept = sorted({row['method'] for row in previous})
+    log.info(
+        'Merging %d fresh rows (%s) into %d kept rows (%s).',
+        len(fresh),
+        ', '.join(sorted(rerun)),
+        len(previous),
+        ', '.join(kept),
+    )
+    combined = previous + fresh
+    names = sorted({r['method'] for r in combined})
+    order = {m: i for i, m in enumerate(names)}
+    combined.sort(
+        key=lambda r: (
+            r['pair'],
+            order[r['method']],
+            float(r['requested_symbols']),
+        )
+    )
+    return combined
+
+
+def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write ``rows`` as a CSV, keyed on the first row's fields."""
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def run_sweep(
     cfg: DictConfig,
     pairs: list[dict[str, str]],
     agents: dict[str, dict[str, LatentSpace]],
     decoders: dict[str, Decoder | None],
     metrics: list[str],
+    checkpoint: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Every (pair, method, rate, repeat) cell of the study."""
+    """Every (pair, method, rate, repeat) cell of the study.
+
+    Rows are flushed to ``checkpoint`` after each (pair, method) block.
+    A full pass is an hour and a half of fits, and a single failure in
+    the last of them would otherwise take every earlier result with it.
+    """
     extra = ('symbols', 'paired_used', 'map_params', 'capacity')
     records: list[dict[str, Any]] = []
 
@@ -227,6 +304,8 @@ def run_sweep(
                 len(cfg.symbols),
                 int(cfg.pilots.n_repeats),
             )
+            if checkpoint is not None:
+                write_rows(checkpoint, records)
     return records
 
 
@@ -326,18 +405,22 @@ def main(cfg: DictConfig) -> None:
     )
 
     try:
-        records = run_sweep(cfg, pairs, agents, decoders, metrics)
+        dataset = cfg.data.get('dataset', cfg.data.source)
+        stem = Path(cfg.output_dir) / f'compression_{dataset}'
+        records = run_sweep(
+            cfg,
+            pairs,
+            agents,
+            decoders,
+            metrics,
+            checkpoint=stem.with_name(f'{stem.name}_records.csv'),
+        )
         summary = aggregate(records, metrics)
         reference = native_reference(pairs, agents, decoders)
 
         use_project_style(ROOT / 'config' / 'plotting' / 'plt.mplstyle')
-        dataset = cfg.data.get('dataset', cfg.data.source)
-        stem = Path(cfg.output_dir) / f'compression_{dataset}'
-        stem.parent.mkdir(parents=True, exist_ok=True)
-        with stem.with_suffix('.csv').open('w', newline='') as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(summary[0]))
-            writer.writeheader()
-            writer.writerows(summary)
+        summary = merge_summary(stem.with_suffix('.csv'), summary)
+        write_rows(stem.with_suffix('.csv'), summary)
 
         hue_of = OmegaConf.to_container(cfg.get('hue_of') or {})
         labels = [p['label'] for p in pairs]

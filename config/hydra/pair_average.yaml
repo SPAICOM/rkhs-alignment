@@ -1,0 +1,87 @@
+# Figures (ii) and (iii), averaged over encoder pairs.
+#
+# `pilot_sweep.py` and `dimension_sweep.py` each draw one encoder pair,
+# with a band over seeds. This study fits nothing: it pools what those two
+# already wrote for every pair listed below and draws the same two
+# figures with the band over *pairs* instead -- the spread a reader needs
+# to judge whether a gap belongs to the method or to one lucky pair.
+#
+# Run the per-pair studies first; for any pair that is missing, this
+# script stops and prints the exact commands that produce it.
+#
+#   just pair-average
+#   just pair-average 'pilot.drop=[direct_mlp:round_robin]'
+
+defaults:
+  - data: semasia
+  - _self_
+
+# --- the pairs --------------------------------------------------------
+# Each is run on its own, receiver pinned, so every pair gets the lambda
+# measured on its own pilots -- the way a deployment would tune it.
+#
+# Five CNN transmitters into five differently pre-trained ViT receivers,
+# no encoder repeated. What RKA can gain is bounded by the headroom
+# Procrustes leaves below the receiver's own accuracy (Spearman +0.92
+# over 81 screened pairs), so the transmitters are CIFAR-10-weak and the
+# receivers strong. Each was screened against every baseline on the same
+# 8192 herded pilots before being listed: RKA led the best of the rest by
+# +2.1..+2.3 pp at k=32 (a residual or direct MLP) and +2.3..+3.3 pp at
+# k=128 (Procrustes), linear probe.
+pairs:
+  - source: regnety_016.pycls_in1k
+    target: vit_large_patch16_224.augreg_in21k_ft_in1k
+  - source: repvgg_b0.rvgg_in1k
+    target: aimv2_large_patch14_224.apple_pt
+  - source: mobilenetv3_large_100.ra_in1k
+    target: vit_base_patch16_224.augreg_in21k
+  - source: efficientvit_b0.r224_in1k
+    target: beit_base_patch16_224.in22k_ft_in22k
+  - source: ghostnet_100.in1k
+    target: eva02_base_patch14_224.mim_in22k
+
+# The chart every per-pair run used, and the head it scored with. The
+# decoder is checked against the dimension-sweep rows, which record it;
+# the pilot-sweep records do not, so keep the two runs on the same head.
+chart:
+  preprocess: whiten
+decoder: linear
+
+# --- figure (ii): the pilot budget ------------------------------------
+pilot:
+  study: pilot_sweep
+  symbols: 32
+  counts: [128, 256, 512, 1024, 2048, 4096, 8192]
+  strategies: [herding, round_robin]
+  # Seeds per pair. The band is over pairs, so one realisation each is
+  # enough; only used to print the commands for a missing pair.
+  seeds: [0]
+  # As in `pilot_sweep.yaml`: `method` drops a method, `method:design`
+  # one of its curves. A presentation choice; the pooled CSV keeps all.
+  drop: []
+
+# --- figure (iii): the compression dimension --------------------------
+dimension:
+  study: dimension_sweep
+  n_pilots: 8192
+  strategy: herding
+  ranks: [16, 32, 64, 128, 256, 512]
+
+eval:
+  metrics: [accuracy, mrr]
+
+# SVCCA takes CCA's hue, as in `dimension_sweep.yaml`.
+hue_of:
+  svcca: cca
+
+output:
+  study: pair_average
+  figures: figures
+  results: results
+  formats: [pdf, png]
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false

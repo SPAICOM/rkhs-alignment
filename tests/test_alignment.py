@@ -15,6 +15,7 @@ tell a correct implementation from a subtly wrong one:
 from __future__ import annotations
 
 from itertools import pairwise
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -23,6 +24,7 @@ from scipy.linalg import null_space
 from src.alignment import (
     PILOT_STRATEGIES,
     CCAAligner,
+    CKAAligner,
     DirectMLPAligner,
     KCCAAligner,
     LatentScaler,
@@ -34,6 +36,7 @@ from src.alignment import (
     RKHSAligner,
     SVCCAAligner,
     check_paired_dims,
+    cka_score,
     orthogonal_procrustes,
     parseval_frame,
     prune_anchors,
@@ -41,6 +44,7 @@ from src.alignment import (
     retrieval_metrics,
     select_pilots,
 )
+from src.alignment.cca import _robust_svd
 from src.anchors import Anchor
 from src.kernels import Kernel
 from src.latent import make_synthetic_agents
@@ -503,6 +507,20 @@ def test_dropping_the_constraint_breaks_orthogonality():
     assert aligner.summary()['rkhs_orthogonality'] > 1e-3
 
 
+def test_resolving_at_another_lambda_matches_a_fresh_fit():
+    """`set_lam` reuses the eigendecomposition; the model must not notice."""
+    X, Y = paired_data()
+    swept = RKHSAligner(lam=1e-6, lam_grid=None).fit(X, Y)
+    for lam in (1e-4, 1e-2, 1.0):
+        fresh = RKHSAligner(lam=lam, lam_grid=None).fit(X, Y)
+        swept.set_lam(lam)
+        assert np.allclose(swept.transform(X), fresh.transform(X), atol=1e-10)
+        for key in ('rkhs_dof', 'rkhs_residual_r2', 'rkhs_orthogonality'):
+            assert np.isclose(
+                swept.summary()[key], fresh.summary()[key], atol=1e-10
+            ), key
+
+
 def test_large_lambda_collapses_onto_procrustes():
     X, Y = paired_data()
     rkhs = RKHSAligner(lam=1e9).fit(X, Y)
@@ -510,6 +528,79 @@ def test_large_lambda_collapses_onto_procrustes():
 
     assert np.abs(rkhs.A_).max() < 1e-8
     assert np.allclose(rkhs.transform(X), procrustes.transform(X), atol=1e-6)
+
+
+def test_trace_scaling_is_a_reparametrisation():
+    """`trace` relabels the lambda axis; it does not change the model.
+
+    Every fit reachable under the literal `N*lam` convention must be
+    reachable under `trace` at `lam / s_mean`, bit for bit. If this ever
+    fails, the scaling has stopped being a change of units and started
+    being a different estimator.
+    """
+    X, Y = paired_data()
+    plain = RKHSAligner(lam=1e-3, lam_grid=None, lam_scaling='n').fit(X, Y)
+    s_mean = plain._solver.s_mean_
+    scaled = RKHSAligner(
+        lam=1e-3 / s_mean, lam_grid=None, lam_scaling='trace'
+    ).fit(X, Y)
+
+    assert s_mean == pytest.approx(0.63, abs=0.1)  # rbf at median bandwidth
+    assert np.array_equal(plain.A_, scaled.A_)
+    assert np.array_equal(plain.transform(X), scaled.transform(X))
+    # The shift is the quantity the two parametrisations agree on.
+    assert plain.summary()['rkhs_lam_effective'] == pytest.approx(
+        scaled.summary()['rkhs_lam_effective']
+    )
+
+
+def test_trace_scaling_makes_lambda_kernel_independent():
+    """One grid, two kernels whose Gram matrices differ by ~10^5.
+
+    Under `n` a shared grid regularises them by wildly different amounts,
+    which is what made the kernel comparison in `alignment/rkhs.yaml`
+    compare placement on the grid rather than the kernels.
+    """
+    X, Y = paired_data()
+    shifts = {}
+    for scaling in ('n', 'trace'):
+        shifts[scaling] = [
+            RKHSAligner(
+                kernel=kernel, lam=1e-2, lam_grid=None, lam_scaling=scaling
+            )
+            .fit(X, Y)
+            .summary()['rkhs_lam_effective']
+            for kernel in ('rbf', 'polynomial')
+        ]
+
+    plain_ratio = shifts['n'][1] / shifts['n'][0]
+    scaled_ratio = shifts['trace'][1] / shifts['trace'][0]
+    assert plain_ratio == pytest.approx(1.0)  # same lam -> same shift
+    assert scaled_ratio > 1e3  # ... on Gram matrices orders of magnitude apart
+
+
+def test_gram_flatness_falls_with_the_source_dimension():
+    """The concentration diagnostic: s_max/s_mean -> 1 in high dimension.
+
+    At that point every Gram eigenvalue is equal, so `lam` selects an
+    overall shrinkage rather than a smooth subspace and the residual can
+    only interpolate the pilots.
+    """
+    rng = np.random.default_rng(0)
+    flatness = []
+    for d in (8, 128):
+        X = rng.standard_normal((300, d))
+        Y = X @ np.linalg.qr(rng.standard_normal((d, d)))[0].T
+        aligner = RKHSAligner(lam=1e-3, lam_grid=None).fit(X, Y)
+        flatness.append(aligner.summary()['rkhs_gram_flatness'])
+
+    assert flatness[0] > 5 * flatness[1]
+    assert flatness[1] < 5  # d=128, N=300: measured ~4.1
+
+
+def test_unknown_lambda_scaling_is_rejected():
+    with pytest.raises(ValueError, match='lam_scaling'):
+        RKHSAligner(lam_scaling='per_sample')
 
 
 def test_lambda_sweep_is_u_shaped():
@@ -1046,6 +1137,254 @@ def test_kcca_rejects_malformed_configuration():
         KCCAAligner(subset_strategy='greedy')
     with pytest.raises(ValueError, match='n_basis_src'):
         KCCAAligner(n_basis_src=1.5)
+
+
+# ---------------------------------------------------------------------
+# CKA-based matching
+# ---------------------------------------------------------------------
+
+
+def test_cka_falls_monotonically_as_the_pairing_is_shuffled():
+    """Table 1 of Maniparambil et al., which is what licenses Eq. (3).
+
+    CKA is maximal on the ground-truth ordering and walks down towards
+    zero as a growing fraction of the rows is permuted away. That is the
+    whole basis of the method: if the score peaks at the true pairing,
+    the permutation maximising it *is* the correspondence, and matching
+    becomes an optimisation rather than a similarity lookup. The paper
+    measures 0.72 -> 0.01 over the same sweep on 5k COCO pairs.
+    """
+    n = 300
+    X, Y = paired_data(n=n, d_src=8, d_tgt=8)
+    K = Kernel('rbf').fit(X)(X, X)
+    L = Kernel('rbf').fit(Y)(Y, Y)
+
+    rng = np.random.default_rng(SEED)
+    scores = []
+    for fraction in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
+        order = np.arange(n)
+        shuffled = rng.choice(n, size=int(fraction * n), replace=False)
+        order[shuffled] = rng.permutation(shuffled)
+        scores.append(cka_score(K[np.ix_(order, order)], L))
+
+    assert cka_score(K, K) == pytest.approx(1.0)
+    assert all(before > after for before, after in pairwise(scores))
+    assert scores[0] > 0.8 and scores[-1] < 0.1
+
+
+def test_local_cka_equals_the_definition_it_is_derived_from():
+    """Eq. (6) is "global CKA of the base set plus one query pair".
+
+    The implementation never builds those ``(M+1) x (M+1)`` Grams -- it
+    expands ``tr(KCLC)`` so the whole score matrix falls out of a single
+    ``(p, M) x (M, q)`` product -- so this pins the closed form against
+    the definition it replaces, one augmented Gram pair at a time.
+    """
+    X, Y = paired_data(n=140, d_src=6, d_tgt=6)
+    aligner = CKAAligner(n_anchors=16, strategy='random').fit(X[:80], Y[:80])
+    fast = aligner.local_cka(X[80:86], Y[80:90])
+
+    base_src, base_tgt = aligner.base_src_, aligner.base_tgt_
+    Z_src = aligner.scaler_src_.transform(X[80:86])
+    Z_tgt = aligner.scaler_tgt_.transform(Y[80:90])
+    slow = np.empty(fast.shape)
+    for i, z in enumerate(Z_src):
+        augmented_src = np.vstack([base_src.anchors, z])
+        K = base_src.kernel(augmented_src, augmented_src)
+        for j, h in enumerate(Z_tgt):
+            augmented_tgt = np.vstack([base_tgt.anchors, h])
+            L = base_tgt.kernel(augmented_tgt, augmented_tgt)
+            slow[i, j] = cka_score(K, L)
+
+    assert np.allclose(fast, slow, atol=1e-10)
+
+
+@pytest.mark.parametrize('method', ['lsa', 'qap'])
+def test_cka_recovers_a_shuffled_pairing(method):
+    """The paper's caption-matching task, on a synthetic encoder pair.
+
+    Both solvers of Sec. 4 are seeded by the same base set and differ
+    only in what they optimise: ``'lsa'`` solves the localised surrogate
+    exactly, ``'qap'`` runs FAQ on the global objective of Eq. (5).
+    """
+    X, Y = paired_data(n=600)
+    aligner = CKAAligner(n_anchors=64).fit(X[:300], Y[:300])
+
+    permutation = np.random.default_rng(SEED).permutation(80)
+    matched = aligner.match(X[300:380], Y[300:380][permutation], method=method)
+    assert np.mean(matched == np.argsort(permutation)) > 0.9
+
+
+def test_stretching_is_what_makes_two_kernels_comparable():
+    """Sec. 4.3's stretching matrix, worth +8.5 QAP points in Table 6.
+
+    ``S = diag(1/std(x_l))`` is exactly ``preprocess='standard'``, and
+    the reason it is load-bearing is that each side fits its own kernel
+    bandwidth from a *pooled* distance scale: let one space's coordinates
+    span two orders of magnitude and a single isotropic bandwidth sees
+    only the loudest few, so the base Gram stops resolving the geometry
+    the other side is being matched against.
+    """
+    X, Y = paired_data(n=400)
+    Y = Y * 10.0 ** np.random.default_rng(3).uniform(-1, 2, size=Y.shape[1])
+
+    stretched, plain = (
+        CKAAligner(n_anchors=64, preprocess=preprocess)
+        .fit(X[:200], Y[:200])
+        .summary()
+        for preprocess in ('standard', 'none')
+    )
+    assert stretched['cka_matching_accuracy'] == 1.0
+    assert plain['cka_matching_accuracy'] < 0.4
+    assert stretched['cka_score'] > 1.5 * plain['cka_score']
+
+
+def test_cka_evaluates_its_kernels_only_against_the_base_set():
+    """The base set is the whole kernel: no ``n x n`` Gram exists here.
+
+    That is what separates this from :class:`RKHSAligner`, which carries
+    its retained pilots into deployment, and it is why the rate is the
+    base-set size rather than anything about the latent width.
+    """
+    X, Y = paired_data(n=400)
+    aligner = CKAAligner(n_anchors=24).fit(X, Y)
+
+    assert aligner.base_src_.gram.shape == (24, 24)
+    assert aligner.base_tgt_.gram.shape == (24, 24)
+    assert aligner.transmit(X[:5]).shape == (5, 24)
+    assert aligner.transmitted_symbols == 24
+
+
+def test_cka_base_set_is_the_same_samples_in_both_spaces():
+    """Anchors are aligned *pairs*, so they have to be real samples."""
+    X, Y = paired_data(n=200)
+    aligner = CKAAligner(n_anchors=12, strategy='fps').fit(X, Y)
+
+    indices = aligner.anchor_.indices
+    assert np.allclose(
+        aligner.base_src_.anchors, aligner.scaler_src_.transform(X)[indices]
+    )
+    assert np.allclose(
+        aligner.base_tgt_.anchors, aligner.scaler_tgt_.transform(Y)[indices]
+    )
+
+
+def test_cka_base_set_must_be_index_based():
+    """A centroid exists only in the space that computed it."""
+    X, Y = paired_data(n=200)
+    with pytest.raises(ValueError, match='index-based'):
+        CKAAligner(n_anchors=8, strategy='kmeans', medoids=False).fit(X, Y)
+
+
+def test_cka_base_set_is_capped_at_the_calibration_set(caplog):
+    X, Y = paired_data(n=40)
+    with caplog.at_level('WARNING'):
+        aligner = CKAAligner(n_anchors=200, strategy='random').fit(X, Y)
+    assert aligner.summary()['cka_n_anchors'] == 40
+    assert 'exceeds the 40 available' in caplog.text
+
+
+def test_cka_zero_shot_decodes_cost_only_the_base_set():
+    """Two of the three decodes need no pilots beyond the anchors.
+
+    The receiver's readout regression and its matching support set are
+    both fitted on its own local latents, which have no partner, so the
+    airtime bill is the base set alone. Only ``readout='source'`` is a
+    paired regression and spends the whole budget.
+    """
+    X, Y = paired_data(n=300)
+    paired = CKAAligner(n_anchors=32, readout='source').fit(X, Y)
+    assert paired.paired_samples_used == 300
+
+    for kwargs in ({'readout': 'target'}, {'decode': 'match'}):
+        zero_shot = CKAAligner(n_anchors=32, **kwargs).fit(X, Y)
+        assert zero_shot.paired_samples_used == 32
+        assert zero_shot.transmitted_symbols == 32
+
+
+def test_cka_feature_mismatch_predicts_the_zero_shot_readout():
+    """The diagnostic that says whether the free decode can be afforded.
+
+    ``readout='target'`` applies a decoder fitted on the receiver's own
+    anchor features to the transmitter's, so it is exactly as good as the
+    two feature spaces coinciding. Near an isometry it matches the paired
+    fit for a fifth of the airtime; once the two encoders genuinely
+    disagree it collapses, and ``cka_feature_mismatch`` moves first.
+    """
+    errors, mismatches = {}, {}
+    for nonlinear in (0.0, 1.0):
+        X, Y = paired_data(n=600, nonlinear=nonlinear)
+        for readout in ('source', 'target'):
+            aligner = CKAAligner(n_anchors=64, readout=readout).fit(
+                X[:300], Y[:300]
+            )
+            errors[nonlinear, readout] = reconstruction_metrics(
+                aligner.transform(X[300:]), Y[300:]
+            )['nmse']
+            mismatches[nonlinear] = aligner.summary()['cka_feature_mismatch']
+
+    assert mismatches[0.0] < 0.25 < mismatches[1.0]
+    # Near an isometry the free decode is as good as the paid one ...
+    assert errors[0.0, 'target'] < 1.5 * errors[0.0, 'source']
+    # ... and it is the mismatch, not the budget, that breaks it.
+    assert errors[1.0, 'target'] > 5 * errors[1.0, 'source']
+
+
+@pytest.mark.parametrize('decode', ['ridge', 'match'])
+def test_cka_channel_split_reproduces_the_map(decode):
+    """``transmit`` then ``receive`` is ``transform``, split at the channel.
+
+    What crosses is the raw ``k(z, A)`` row: the centring and the
+    ``HSIC(G, G)^{-1/2}`` scale are functions of the base Gram, which the
+    receiver already holds, so spending airtime on them would be waste.
+    """
+    X, Y = paired_data(n=300)
+    aligner = CKAAligner(n_anchors=32, decode=decode).fit(X, Y)
+    assert np.allclose(
+        aligner.receive(aligner.transmit(X[:25])), aligner.transform(X[:25])
+    )
+
+
+def test_hard_matching_returns_real_target_latents():
+    """``match_temperature=0`` is retrieval, so its output is a sample.
+
+    Raising the temperature mixes the top candidates instead, which is
+    what a map wants -- a piecewise-constant map cannot land between two
+    support points -- but the hard rule is the paper's, and it never
+    invents a latent the receiver has not actually seen.
+    """
+    X, Y = paired_data(n=200)
+    aligner = CKAAligner(
+        n_anchors=16, decode='match', match_temperature=0.0
+    ).fit(X, Y)
+
+    support = aligner.scaler_tgt_.inverse_transform(aligner.support_)
+    for row in aligner.transform(X[:30]):
+        assert np.isclose(np.abs(support - row).sum(axis=1), 0.0).any()
+
+    soft = CKAAligner(
+        n_anchors=16, decode='match', match_temperature=0.25
+    ).fit(X, Y)
+    assert (
+        reconstruction_metrics(soft.transform(X), Y)['nmse']
+        < (reconstruction_metrics(aligner.transform(X), Y)['nmse'])
+    )
+
+
+def test_cka_rejects_malformed_configuration():
+    with pytest.raises(ValueError, match='decode'):
+        CKAAligner(decode='nearest')
+    with pytest.raises(ValueError, match='readout'):
+        CKAAligner(readout='both')
+    with pytest.raises(ValueError, match='n_anchors'):
+        CKAAligner(n_anchors=1)
+
+    X, Y = paired_data(n=80)
+    aligner = CKAAligner(n_anchors=8).fit(X, Y)
+    with pytest.raises(ValueError, match='match method'):
+        aligner.match(X[:10], Y[:10], method='greedy')
+    with pytest.raises(ValueError, match='equal size'):
+        aligner.match(X[:10], Y[:12])
 
 
 def test_l_ortho_orthogonalises_the_least_squares_map():
@@ -1773,3 +2112,76 @@ def test_scheduled_bandwidth_grows_with_the_budget():
     assert scheduled_bandwidth(500, 500) == pytest.approx(3.9)
     with pytest.raises(ValueError, match='n_pool must be positive'):
         scheduled_bandwidth(10, 0)
+
+
+@pytest.mark.parametrize('method', ['pca', 'pga'])
+def test_unshrunk_factorisation_never_forms_the_left_factor(method):
+    """The SVD path must not materialise an ``n x n`` matrix.
+
+    Whitening statistics are estimated from all local data rather than
+    from the pilots (``Aligner.fit``), so ``n`` here is the whole latent
+    bank -- tens of thousands of rows. Asking for the full left factor
+    costs ``n^2`` doubles (20 GB on a 50k bank) and it is discarded
+    unread on the next line; only the right singular vectors are ever
+    used. This asserts the shape contract directly, because the cost is
+    invisible in the returned values: the two routes agree exactly, and
+    the only symptom of a regression is a run that takes twenty times
+    longer.
+    """
+    rng = np.random.default_rng(SEED)
+    n, d = 600, 40
+    X = rng.normal(size=(n, d)) @ np.diag(np.linspace(10.0, 0.1, d))
+
+    seen = []
+    real_svd = np.linalg.svd
+
+    def spy(a, *args, **kwargs):
+        out = real_svd(a, *args, **kwargs)
+        seen.append(np.shape(a))
+        return out
+
+    with mock.patch.object(np.linalg, 'svd', spy):
+        scaler = LatentScaler(method, n_components=5).fit(X)
+
+    assert seen, 'the unshrunk path should factorise something'
+    # Every factorisation is of a matrix no larger than d x d: the QR
+    # reduction happens first, so nothing of size n reaches the SVD.
+    assert all(max(shape) <= d for shape in seen), seen
+    assert scaler.out_dim in (5, 6)  # 'pga' carries the radius too
+
+
+def test_canonical_svd_falls_back_when_the_fast_driver_fails():
+    """A singular cross-covariance must not abort the fit.
+
+    numpy's ``gesdd`` does not always converge on a numerically singular
+    matrix, which a kernel feature map reliably produces -- its effective
+    rank is far below its column count. Measured on a 1980-column map
+    the spectrum spanned 3e-18 to 1, and the fast driver raised where
+    ``gesvd`` returned. The fallback has to yield a genuine
+    factorisation, not merely avoid the exception.
+    """
+    rng = np.random.default_rng(SEED)
+    d, k = 40, 6
+    M = rng.normal(size=(d, k)) @ rng.normal(size=(k, d))  # rank k << d
+
+    with mock.patch.object(
+        np.linalg, 'svd', side_effect=np.linalg.LinAlgError('did not converge')
+    ):
+        U, rho, Vt = _robust_svd(M)
+
+    assert np.allclose(U * rho @ Vt, M, atol=1e-8)
+    assert np.all(np.diff(rho) <= 1e-12)  # descending
+    assert np.allclose(U.T @ U, np.eye(U.shape[1]), atol=1e-8)
+    assert np.allclose(Vt @ Vt.T, np.eye(Vt.shape[0]), atol=1e-8)
+
+
+def test_canonical_svd_reports_non_finite_input_as_itself():
+    """A NaN is an upstream bug, not a conditioning problem.
+
+    Retrying it with a slower driver would only fail again, and more
+    slowly; the error should name the real cause.
+    """
+    M = np.eye(5)
+    M[2, 3] = np.nan
+    with pytest.raises(np.linalg.LinAlgError, match='non-finite'):
+        _robust_svd(M)

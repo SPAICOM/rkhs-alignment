@@ -1,0 +1,189 @@
+# Figure (i): RKA against Procrustes, over the RKHS regularisation.
+#
+# One figure is one metric against lambda: the RKA curve, and the flat
+# Procrustes line it has to be read against (flat because Procrustes has
+# no lambda -- it is the lambda -> infinity limit of the curve above it).
+#
+# That figure is then repeated over the two axes the study varies, both
+# declared here rather than in a shell loop:
+#
+#   charts        -- the preprocessing configuration, applied to RKA and
+#                    Procrustes alike (see `axes/default.yaml` on why the
+#                    two must share a chart);
+#   pilots        -- the calibration budget N.
+#
+# so one run writes `len(charts) * len(pilots) * len(metrics)` figures and
+# `len(charts) * len(pilots)` CSVs, every one of them named after the
+# configuration that produced it.
+#
+#   just lambda-sweep
+#   uv run scripts/lambda_sweep.py symbol_divisor=7
+#   uv run scripts/lambda_sweep.py 'pilots.counts=[500, 1000]'
+#   uv run scripts/lambda_sweep.py 'charts=[{preprocess: pca}]'
+#   uv run scripts/lambda_sweep.py lam.min=1e-6 lam.max=1e-1 lam.per_decade=8
+#   uv run scripts/lambda_sweep.py data=semasia_mnist
+#
+# The CSVs it writes are the input to `pilot_sweep.py`, which reads RKA's
+# best lambda per budget back out of them.
+
+defaults:
+  - axes: default
+  - data: semasia
+  # `methods` is the field of the figure. The one named by `sweep_method`
+  # gets the lambda axis; every other entry is a flat line on it.
+  # Colour follows the key, so `rkhs` and `procrustes` keep the hues they
+  # hold in every other figure in the repo.
+  - alignment@methods.rkhs: rkhs
+  - alignment@methods.procrustes: procrustes
+  - _self_
+
+seed: 42
+
+# --- encoder pairs ----------------------------------------------------
+# Star topology: every other encoder transmits into one receiver.
+#
+# `receiver: null` does not mean "the first model listed" -- it means the
+# *widest* agent available, resolved by measuring them. The receiver's
+# latent space is where every transported latent has to land, so a narrow
+# receiver caps what the channel can carry for every method at once and
+# the comparison starts measuring the receiver instead of the alignment.
+# Uncommenting a wider encoder in the data config therefore moves the
+# receiver to it, with no other edit.
+#
+# Pin one explicitly to override the rule, or give `pairs` outright:
+#
+#   receiver: vit_small_patch16_224.augreg_in1k
+#   pairs: [{source: regnety_016.pycls_in1k, target: ...}]
+#
+# The resolved direction and both widths are logged at the top of a run.
+pairs: null
+receiver: null
+max_pairs: 4
+
+# --- what is swept ----------------------------------------------------
+# Which entry of `methods` carries the lambda axis. Anything else in
+# `methods` is fitted once per cell and drawn as a horizontal line.
+sweep_method: rkhs
+
+# The lambda axis. `grid` wins when set; otherwise the axis is log-spaced
+# from `min` to `max` at `per_decade` points per decade.
+#
+# The default spans eleven decades at two points per decade, which is
+# wide enough to show both the interior optimum and the Procrustes limit
+# on the right, and coarse enough to run the whole (chart x budget) grid.
+# It is the wrong instrument for reading the optimum off precisely --
+# narrow the window and raise the resolution for that:
+#
+#   uv run scripts/lambda_sweep.py lam.min=1e-6 lam.max=1e-1 lam.per_decade=8
+lam:
+  grid: null
+  min: 1.0e-10
+  max: 1.0e+2
+  per_decade: 2
+
+# --- calibration data -------------------------------------------------
+# The budget axis itself lives in `axes/default.yaml`, shared with
+# `pilot_sweep.py`. These are the parts only this study needs.
+pilots:
+  # One pilot set per (source, repeat), shared by every lambda: the sweep
+  # has to measure regularisation, not pilot luck.
+  strategy: herding     # random | kmeans | fps | stratified | herding
+  n_repeats: 1          # herding is deterministic, so 1 unless randomised
+
+# --- receiver decoder -------------------------------------------------
+decoder:
+  enabled: true
+  # The receiver's task head, fitted on its own raw latents and never on
+  # a transported one.
+  #
+  # `mlp`, not `linear`, and the reason is specific to this encoder pair.
+  # A linear probe makes `decoder(align(x))` an *affine* classifier on the
+  # transmitter's latent, so post-alignment accuracy is capped by the best
+  # affine classifier the transmitter admits -- 0.9207 here, above the
+  # receiver's own 0.9120, because vit_small is the better CIFAR-10
+  # encoder. Both methods then sit on that cap and their accuracy ordering
+  # is noise: measured at N=400/800/1536 the linear head ranks RKA *below*
+  # Procrustes (-0.0006/-0.0004/-0.0003) while MRR, which uses no decoder
+  # at all, ranks it above (+0.0014/+0.0077/+0.0078).
+  #
+  # The MLP head lifts the receiver's own accuracy to 0.9228, back above
+  # the transmitter's affine cap, so "native RX" is a ceiling again and
+  # nothing transported beats it. It also ranks the methods the way the
+  # decoder-free metric does (+0.0010/+0.0008/+0.0008).
+  #
+  # The cost is real and worth knowing: an expressive head partly rescues
+  # a badly fitted map, so it compresses the pilot axis. Over N=50..1536
+  # the linear head spans 0.797..0.902 and the MLP only 0.823..0.902 --
+  # low budgets look better than they are. Switch back with
+  # `decoder.kind=linear` when the question is how much a pilot is worth
+  # rather than which map is better.
+  kind: mlp
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+eval:
+  # One figure per entry, per cell. The first is the metric the "best
+  # lambda" recommendation is read off, and the one `pilot_sweep.py`
+  # imports by default.
+  metrics: [accuracy, mrr]
+  topk: [1, 5]
+
+# --- output -----------------------------------------------------------
+# Figures land under
+#   <figures>/<study>/<dataset>/<chart>/<stem>_<metric>.{pdf,png}
+# and the CSV behind them under
+#   <results>/<study>/<dataset>/<stem>.csv
+# where <stem> names every axis of the cell. See `src/reporting.py`.
+output:
+  study: lambda_sweep
+  figures: figures
+  results: results
+  formats: [pdf, png]
+  title: null           # null -> built from the cell's configuration
+
+# Skip a cell whose CSV is already on disk, under `output.results` (its
+# figures are redrawn from it, which costs nothing). Nothing is ever read
+# back from wandb -- these scripts only write to it -- so this flag is the
+# only thing that can make a run reuse an earlier result.
+#
+# It is on because the justfile re-invokes the script until it completes:
+# these runs segfault intermittently on this machine, and resume is what
+# makes a retry cost only the cell that died rather than the whole grid.
+# Turning it off means a crash restarts the sweep from nothing.
+#
+# Reuse is keyed on the *filename*, which names every axis of the cell --
+# dataset, pair, chart, rate, budget, lambda grid -- so a configuration
+# that differs in any of them writes a different file and cannot collide
+# with an older result. Change something the name does not carry and that
+# guarantee is gone; `resume=false` is the answer there.
+resume: true
+
+# Draw the figures from the CSVs already on disk and fit nothing. Use it
+# to restyle, or to add a metric that was already computed.
+plot_only: false
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

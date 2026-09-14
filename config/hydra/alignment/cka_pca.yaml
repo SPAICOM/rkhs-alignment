@@ -1,0 +1,174 @@
+# @package alignment
+# CKA-based matching (Maniparambil et al., CVPR 2024, "Do Vision and
+# Language Encoders Represent the World Similarly?").
+#
+# The paper's finding is that CKA between two independently trained
+# encoders drops from 0.72 to 0.01 as the pairing is shuffled out, so CKA
+# is not just a similarity score -- its maximiser *is* the
+# correspondence. Both of its solvers live on the class:
+#
+#   aligner.match(X_src, X_tgt, method='lsa')   local CKA + assignment
+#   aligner.match(X_src, X_tgt, method='qap')   seeded FAQ, Eq. (5)
+#
+# Everything is anchored on a shared *base set* of aligned pairs, which is
+# this package's anchor set under the paper's name for it -- and the only
+# thing either kernel is ever evaluated against, so no n x n Gram is
+# formed on either side.
+#
+# Against the other anchor method in the field: `relative` compares two
+# anchor-similarity vectors coordinatewise, so anchor i must mean the same
+# thing to both agents in an absolute sense. This compares them through
+# the base set's own kernel after the centring and re-scaling of Eq. (4),
+# so only the *pattern* has to agree. Same rate, same anchors, different
+# notion of agreement -- Sec. 2 of the paper is an argument for the second
+# ("an implicit measure that captures the similarity of similarities").
+
+_target_: src.alignment.CKAAligner
+_convert_: all
+
+# --- the base set -----------------------------------------------------
+# M, the aligned pairs everything is measured against. Pinned here to the
+# paper's own base-set size, which is what every number it reports is
+# measured at (against a query set of 500); null resolves to the same 320.
+# Either way it is capped at the pilot budget, with a warning.
+#
+# This is the rate *and*, under the zero-shot decodes below, the entire
+# airtime bill: `paired_samples_used` reports M rather than the budget,
+# because nothing else in the method needs a partner.
+n_anchors: 320
+
+# The base set must be index-based -- the receiver has to embed the very
+# same inputs, so anchors that exist only in the source space cannot be
+# transferred. (`relative`'s anchor_transfer=clusters is the construction
+# for those.) Any index-based design works: random | kmeans | fps |
+# stratified | herding | round_robin.
+strategy: kmeans
+
+# Sec. 4.3: "simple k-means clustering on the image embeddings works
+# best", taking "one closest sample to each of the S cluster centers" --
+# which is kmeans + medoids exactly. Worth +8.2 QAP points in their
+# Table 6, and it is also what makes the anchors index-based.
+medoids: true
+
+# --- kernels ----------------------------------------------------------
+# The paper uses kernel CKA with an RBF kernel throughout.
+kernel: rbf               # rbf | laplacian | polynomial | linear | cosine
+
+# l, the receiver's kernel. null reuses `kernel`. The two are separate
+# kernels in Eq. (1) and their bandwidths are fitted per space regardless
+# -- CKA is invariant to each side's kernel scale by construction, which
+# is the whole reason two unrelated encoders can be compared at all.
+kernel_tgt: null
+
+# null fits one bandwidth per space by the median heuristic, on that
+# agent's own local cloud (`src_context` / `tgt_context` when given).
+# Costs no airtime: a bandwidth is a single-space statistic.
+gamma: null
+bandwidth_scale: 1.0      # >1 smooths, <1 sharpens
+
+degree: 3                 # polynomial kernel only
+coef0: 1.0                # polynomial kernel only
+
+# --- how the anchor code becomes a target latent ----------------------
+# The paper's output is a permutation; this package's contract is a map
+# applicable to samples that have no partner. Two bridges:
+#
+#   ridge  a linear readout from the anchor features into the receiver's
+#          latents. The general-purpose choice, and the one that keeps
+#          this method comparable with the rest of the field.
+#   match  the paper's transport, literally: score the query against a
+#          support set of the receiver's own latents with the local CKA
+#          of Eq. (6) and return a (softmax-weighted) support latent.
+#          Nothing is fitted and the output is always a real target
+#          latent, so it is the *retrieval* method rather than a
+#          regression -- and it is zero-shot, costing only the anchors.
+decode: ridge
+
+# Which side's anchor features the ridge readout is fitted on.
+#
+#   source  regress phi_src(Z_src) on Z_tgt over the pilot set. A paired
+#           fit, and the stronger map.
+#   target  fit phi_tgt(Z) against Z on the receiver's own latents alone,
+#           then apply it to the transmitter's features. Costs no airtime
+#           past the anchors, which is the paper's zero-shot setting.
+#
+# Whether `target` can be afforded is not a matter of taste, and the
+# summary answers it directly: `cka_feature_mismatch` is the relative
+# distance between the two anchor feature spaces, and it is the quantity
+# the zero-shot route assumes to be ~0. Measured on a smooth synthetic
+# pair at 128 anchors (held-out NMSE):
+#
+#   mismatch    0.16    0.27    0.60
+#   target     0.069   0.119   0.661
+#   source     0.062   0.069   0.101
+#
+# Near an isometry the two are indistinguishable and `target` is free.
+readout: source
+
+# Ridge of that readout, relative to the mean eigenvalue of the feature
+# Gram, so one setting survives a change of kernel or base-set size (the
+# features carry a HSIC(G,G)^{-1/2} scale that depends on both).
+decode_alpha: 1.0e-2
+
+# Softmax temperature of `decode: match`, in standard deviations of the
+# per-query score spread -- absolute units would be meaningless, since
+# the base set contributes M of the M+1 points in both augmented Grams
+# and every candidate therefore scores within a hair of every other.
+#
+# 0 is the paper's hard retrieval, which returns an actual target latent;
+# as a *map* it is much worse (0.50 held-out NMSE against 0.25 here),
+# because a piecewise-constant map cannot land between two support
+# points. Above ~1 the barycentre flattens towards the support mean and
+# it degrades again (0.55).
+match_temperature: 0.25
+
+# --- cost guard -------------------------------------------------------
+# Cap on the local cloud each side uses for its bandwidth, its readout
+# regression and its matching support set. None of the three needs
+# pairing, so all three are drawn from the unpaired context when a study
+# provides one.
+max_points: 2000
+
+# --- standardisation --------------------------------------------------
+# This is the paper's *stretching* matrix S = diag(1/std(x_l)) of Sec.
+# 4.3, which "spreads the representations out in each modality without
+# sacrificing the relative positions", applied to both spaces before the
+# kernels are formed. It is not really optional: dropping it costs 8.5
+# QAP points in their Table 6, more than any other single choice here.
+# PCA rather than the usual `standard`: a rotation onto the principal
+# axes, truncated to the leading directions, with the variances left
+# alone. Two reasons it is the right chart for this method. The kernel is
+# isotropic, so it measures every retained coordinate on the same
+# footing, and in a raw 2048- or 4096-dimensional latent the pairwise
+# distances it depends on are dominated by the noise directions -- the
+# curse of dimensionality that makes an RBF Gram uninformative long
+# before it underflows (see `kcca.yaml` for the extreme case). And
+# unlike whitening, PCA does not rescale the retained axes back up, so
+# the low-variance directions it keeps cannot be amplified into the
+# distance.
+preprocess: pca
+eps: 1.0e-6
+# Tied to the rate: at `n_anchors = k` the kernel is evaluated in the
+# leading k principal directions, so the method's two dimensions move
+# together and CKA at rate k is comparable with every other method at
+# rate k. This is an interpolation, so writing `n_anchors` (which is what
+# `rate_key` names) carries `n_components` with it.
+n_components: ${.n_anchors}
+
+# --- pilot design -----------------------------------------------------
+# k-means, matching the base-set construction above: the anchors are
+# drawn from the pilots, so selecting both the same way means the base
+# set is a genuine k-means summary of the latent distribution rather than
+# a summary of an arbitrary subset of it. This is the same argument the
+# `relative` and `ppfe` presets make, and it is the paper's own
+# clustering ablation seen from one step upstream.
+pilot_strategy: kmeans
+
+# --- channel rate -----------------------------------------------------
+# Which knob sets the number of coefficients this method puts on the
+# channel per sample, so `symbols` in the comparison config can rate-match
+# the field with one number. The base-set size: one kernel value per
+# anchor is transmitted, and the latent width is irrelevant.
+rate_key: n_anchors
+
+seed: ${seed}

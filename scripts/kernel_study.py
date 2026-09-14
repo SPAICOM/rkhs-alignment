@@ -132,7 +132,15 @@ def fit_and_score(
     )
     scores['capacity'] = float(summary.get('rkhs_capacity', 0))
     scores['lam'] = float(summary.get('rkhs_lam', 0.0))
+    # `lam` alone is not comparable across the axes this script sweeps:
+    # the Gram eigenvalues carry the kernel's scale, which spans five
+    # orders of magnitude between rbf and polynomial and 16x across
+    # `bandwidth_scale`. `lam_effective` is the shift actually applied,
+    # and `gram_flatness` (s_max/s_mean) says whether lam had a smooth
+    # subspace to select at all.
+    scores['lam_effective'] = float(summary.get('rkhs_lam_effective', 0.0))
     scores['gram_cond'] = float(summary.get('rkhs_gram_cond', 0.0))
+    scores['gram_flatness'] = float(summary.get('rkhs_gram_flatness', 0.0))
     return scores
 
 

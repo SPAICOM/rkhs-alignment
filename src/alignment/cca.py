@@ -63,6 +63,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+from scipy.linalg import svd as scipy_svd
 
 from .base import Aligner
 
@@ -86,6 +87,45 @@ def _inverse_sqrt(cov: np.ndarray, ridge: float) -> np.ndarray:
     return (evecs * np.clip(evals, shift, None) ** -0.5) @ evecs.T
 
 
+def _robust_svd(
+    M: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """SVD that survives a numerically singular cross-covariance.
+
+    numpy's driver is LAPACK ``gesdd`` (divide and conquer), which is the
+    fast choice but does not always converge on a badly conditioned
+    matrix. The whitened cross-covariance here reaches it: a kernel
+    feature map has far lower effective rank than it has columns, and on
+    a 1980-column map the spectrum was measured spanning 3e-18 to 1 --
+    a condition number of 3e17, where ``gesdd`` raises and the slower
+    QR-iteration driver ``gesvd`` returns.
+
+    Falling back is safe rather than papering over a problem: the
+    directions that defeat the fast driver are the ones below machine
+    precision, which carry no canonical correlation worth keeping and
+    are discarded by the truncation to ``k`` anyway. A non-finite ``M``
+    is a different failure -- a genuine upstream bug -- so it is
+    reported as itself instead of being retried.
+    """
+    if not np.isfinite(M).all():
+        raise np.linalg.LinAlgError(
+            'Cross-covariance contains non-finite entries; the canonical '
+            'bases are undefined. This is an upstream problem in the '
+            'features or their covariances, not a conditioning one.'
+        )
+    try:
+        return np.linalg.svd(M, full_matrices=False)
+    except np.linalg.LinAlgError:
+        log.warning(
+            'Fast SVD driver did not converge on a %d x %d '
+            'cross-covariance; retrying with the QR-iteration driver. '
+            'The matrix is numerically singular, so the trailing '
+            'canonical directions are noise.',
+            *M.shape,
+        )
+        return scipy_svd(M, full_matrices=False, lapack_driver='gesvd')
+
+
 def _canonical_bases(
     Xc: np.ndarray, Yc: np.ndarray, k: int, reg: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -103,7 +143,7 @@ def _canonical_bases(
     C_tgt_inv_sqrt = _inverse_sqrt(Yc.T @ Yc / n, reg)
     M = C_src_inv_sqrt @ (Xc.T @ Yc / n) @ C_tgt_inv_sqrt
 
-    U, rho, Vt = np.linalg.svd(M, full_matrices=False)
+    U, rho, Vt = _robust_svd(M)
     return C_src_inv_sqrt @ U[:, :k], C_tgt_inv_sqrt @ Vt[:k].T, rho[:k]
 
 

@@ -1,0 +1,173 @@
+# Figure (iii): the field against the compression dimension.
+#
+# One figure, one panel per metric (accuracy, MRR), each plotting the
+# methods against the number of transmitted symbols k at a single, fixed
+# pilot budget N. The counterpart of `pilot_sweep.yaml` along the other
+# axis: there the rate is pinned and N moves, here N is pinned and the
+# rate moves.
+#
+# Two kinds of curve share the figure:
+#
+#   read back -- RKA and Procrustes are not refitted. `lambda_sweep.py`
+#                already measured both at every (chart, rank, budget)
+#                cell, and RKA's point is the one at the lambda that
+#                maximised `read_back.metric` in that cell.
+#   fitted    -- the entries of `methods`, fitted here on the *same*
+#                pilots the lambda sweep used: CCA, SVCCA and Proto-PFE.
+#
+# So `just lambda-sweep` has to have run first, with this `ranks` axis
+# and with `pilots.n_pilots` among its budgets.
+#
+#   just dimension-sweep
+#   just dimension-sweep pilots.n_pilots=4096 'ranks=[16,32,64,128]'
+#   just dimension-sweep decoder.kind=linear
+#   just dimension-sweep plot_only=true
+
+defaults:
+  - axes: default
+  - data: semasia
+  # --- fitted here --------------------------------------------------------
+  # CCA and SVCCA get no chart, unlike the read-back methods: CCA is
+  # invariant to any invertible map of either space, so whitening it is a
+  # no-op that costs a covariance, and SVCCA's SVD truncation ranks the
+  # spectrum that whitening would flatten. Both presets centre themselves
+  # and take the rate through `n_canonical`.
+  - alignment@methods.cca: cca
+  - alignment@methods.svcca: svcca
+  # Proto-PFE does take the chart -- see `charted` below.
+  - alignment@methods.ppfe: ppfe
+  # --- the consistency check ----------------------------------------------
+  # Refitted per (chart, rank) and compared with the Procrustes numbers
+  # the lambda sweep wrote; see `verify`.
+  - alignment@verify.method: procrustes
+  - _self_
+
+# Seeds the candidate pool and the pilot selection. Has to equal
+# `lambda_sweep.yaml`'s, or the fitted methods see different pilots from
+# the read-back ones.
+seed: 42
+
+# --- encoder pairs ----------------------------------------------------
+# Resolved exactly as in the lambda sweep, which is what makes the `pairs`
+# column of its CSVs match. See `lambda_sweep.yaml`.
+pairs: null
+receiver: null
+max_pairs: 4
+
+# --- what is read back ------------------------------------------------
+read_back:
+  study: lambda_sweep
+  # In figure order, which is also colour order. `swept` is the method
+  # that carried the lambda axis in that study (its `sweep_method`); every
+  # other name is read from the flat `<name>_<metric>` columns.
+  methods: [procrustes, rkhs]
+  swept: rkhs
+  # The swept method's lambda is chosen per rank by this metric, and every
+  # metric is then reported at that one lambda -- the same rule
+  # `pilot_sweep.py` applies, so a point here and a point there at the
+  # same (rank, budget) are the same fit.
+  metric: accuracy
+
+# --- the calibration set ----------------------------------------------
+pilots:
+  # One budget for the whole figure. Every rank on the axis has to be
+  # strictly below it: with N <= k the whitened chart is rank-deficient
+  # and RKA's residual has no degrees of freedom, so the comparison would
+  # stop being about compression.
+  n_pilots: 8192
+  # Must match the lambda sweep's design; the lookup filters on it.
+  strategy: herding
+
+# --- which fitted methods take the chart -------------------------------
+# Merged with every chart and rank exactly as RKA and Procrustes were in
+# the lambda sweep, so they work on the same truncated-whitened
+# coordinates. Proto-PFE belongs here: its rate is the number of anchors,
+# and its preset's `standard` scaling would put it on a different chart.
+# Whitening at *full* width is not the alternative -- measured on
+# regnety_016 -> vit_large at N=8192, k anchors in a flattened 888-dim
+# spectrum collapse (accuracy 0.48 at k=32, against 0.84 on whiten-k32).
+# Every other fitted method takes no chart, for the reason given above.
+charted: [ppfe]
+
+# The fitted methods standardise from the pilots alone, as the lambda
+# sweep's charts do. `true` lets SVCCA estimate its SVD basis from all of
+# each device's unpaired data instead -- its intended deployment, but no
+# longer the same information the read-back methods had.
+use_local_context: false
+
+# --- the consistency check ----------------------------------------------
+# A read-back curve is only comparable to a fitted one if both came from
+# the same pilots, decoder and preprocessing. None of that is recorded in
+# the lambda sweep's CSVs, so it is checked instead: Procrustes is cheap
+# to refit, deterministic given its inputs, and in every CSV. A mismatch
+# beyond `tolerance` (accuracy, absolute) stops the run.
+verify:
+  enabled: true
+  tolerance: 5.0e-4
+
+# --- receiver decoder -------------------------------------------------
+# Must be the head the lambda sweep scored with -- `verify` catches it if
+# not. See `lambda_sweep.yaml` on `mlp` against `linear`.
+decoder:
+  enabled: true
+  kind: mlp
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+eval:
+  # One panel per entry. Each has to be a metric the lambda sweep wrote.
+  metrics: [accuracy, mrr]
+  topk: [1, 5]
+
+# --- figure -----------------------------------------------------------
+# Colour is the method family: SVCCA is CCA after an SVD, so it takes
+# CCA's hue with its own line style, as in `compression_sweep.yaml`.
+hue_of:
+  svcca: cca
+
+# --- output -----------------------------------------------------------
+# Figures land under
+#   <figures>/<study>/<dataset>/<chart>/<stem>.{pdf,png}
+# the curves under <results>/<study>/<dataset>/<stem>.csv, and the fitted
+# methods' records under <results>/<study>/<dataset>/<fits stem>.csv.
+output:
+  study: dimension_sweep
+  figures: figures
+  results: results
+  formats: [pdf, png]
+  title: null           # null -> built from the run's configuration
+
+# Reuse fitted records already on disk, keyed on (method, chart, rank), so
+# adding a method to `methods` fits only that method. The file is named
+# after the dataset, pair, budget, design and decoder, not after a
+# method's hyper-parameters: change a preset and pass `resume=false`.
+resume: true
+
+# Draw from the records already on disk and fit nothing.
+plot_only: false
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

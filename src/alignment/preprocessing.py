@@ -68,6 +68,21 @@ def _deterministic_signs(basis: np.ndarray) -> np.ndarray:
     return basis * signs
 
 
+def _complete_basis(basis: np.ndarray, d: int) -> np.ndarray:
+    """Extend orthonormal columns to a full ``d``-dimensional basis.
+
+    Reached only when the cloud has fewer points than dimensions, where
+    it spans at most ``n - 1`` directions and the rest carry exactly zero
+    variance. Those added axes are arbitrary -- any orthonormal
+    completion is as good as any other -- but a truncation rule asked for
+    more components than the data can support will index into them, and
+    they have to be orthonormal when it does. The caller warns in that
+    case; this only makes the result well-formed.
+    """
+    q, _ = np.linalg.qr(np.hstack([basis, np.eye(d)]))
+    return q[:, :d]
+
+
 class LatentScaler:
     """Fitted, invertible standardisation of a latent point cloud.
 
@@ -411,12 +426,22 @@ class LatentScaler:
             evals, evecs = evals[order], evecs[:, order]
         else:
             self.shrinkage_ = 0.0
-            _, sv, Vt = np.linalg.svd(Xc, full_matrices=True)
+            # Reduced by a QR first. ``R`` has the same singular values
+            # and the same right singular vectors as ``Xc``, so this is
+            # the identical factorisation -- but it never forms the n x n
+            # left factor, which is never read and which the whitening
+            # context makes enormous: these statistics are estimated from
+            # all local data rather than from the pilots (see
+            # ``Aligner.fit``), so ``n`` is the whole latent bank, and
+            # ``full_matrices=True`` there asks for a 50000 x 50000 ``U``
+            # -- 20 GB -- one line before discarding it.
+            R = np.linalg.qr(Xc, mode='r')
+            _, sv, Vt = np.linalg.svd(R)
             # Pad: svd returns min(n, d) singular values, and a truncation
             # rule still has to see the empty directions as zero-variance.
             evals = np.zeros(d)
             evals[: sv.size] = sv**2 / n
-            evecs = Vt.T
+            evecs = Vt.T if Vt.shape[0] == d else _complete_basis(Vt.T, d)
         return evals, _deterministic_signs(evecs)
 
     def _rank(self, evals: np.ndarray, total: float, d: int) -> int:

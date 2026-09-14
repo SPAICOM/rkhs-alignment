@@ -1,0 +1,179 @@
+# @package _global_
+#
+# The sweep axes both studies share.
+#
+# `lambda_sweep.py` measures RKA's best lambda per (chart, rate, budget)
+# and `pilot_sweep.py` reads those lambdas back at exactly those budgets.
+# That lookup is an *exact* match on the budget by design -- an
+# interpolated lambda is not one anybody measured -- so the two runs have
+# to agree on the axis. Stating it once is what keeps them from drifting;
+# override it here and both studies move together.
+#
+#   uv run scripts/lambda_sweep.py 'pilots.multipliers=[1.5, 3.0]'
+#   uv run scripts/lambda_sweep.py 'pilots.counts=[500, 1000]'
+
+# --- channel rate -----------------------------------------------------
+# `null` does not mean "no rate": it means *derive* the request, as
+# ceil(d_r / symbol_divisor) against the receiver's latent width. An
+# explicit `symbols` states it outright.
+#
+# What the request means then depends on whether it compresses anything.
+# `n_components` is applied to *both* charts, transmitter and receiver
+# alike -- that is what makes a truncated run rate-matched, and it is the
+# behaviour the compression studies are built on. So a rank at or above
+# `max_rank` (the narrowest space in the pair, i.e. the most coefficients
+# the transmitter could possibly emit) is not a rate at all: applying it
+# would leave the transmitter untouched and throw away the receiver's
+# surplus directions -- compressing the wrong side of the channel.
+#
+# Such a request is therefore read as NO COMPRESSION. `n_components` goes
+# unset, every space keeps its largest available dimension, and the run
+# is tagged `kfull` rather than claiming a truncation that did not
+# happen. Only a request genuinely below `max_rank` is a rate.
+#
+# On the shipped pair -- TX vit_small (384) -> RX regnety_016 (888):
+#
+#   symbol_divisor: 1  ->  888  >= 384  ->  no compression  (kfull)
+#   symbol_divisor: 2  ->  444  >= 384  ->  no compression  (kfull)
+#   symbol_divisor: 3  ->  296  <  384  ->  k296
+#   symbols: 48        ->   48  <  384  ->  k48
+#
+# The gap RKA opens over Procrustes lives at the truncated ranks: it is
+# ~+0.000 accuracy at full width, where the centred RBF Gram matrix
+# degenerates towards the identity and lambda has no smooth subspace to
+# select, and grows as the rank falls. Sweep the rank by putting it on
+# the chart axis, which takes `n_components` per entry:
+#
+#   charts=[{preprocess: whiten, n_components: 192},
+#           {preprocess: whiten, n_components: 48}]
+# Expressing the request against d_r rather than as a bare number is what
+# lets one config follow the encoder pair: the interesting quantity is
+# the compression factor, and d_r changes underneath it. When the request
+# is a rate, it is written into whichever knob each preset names in
+# `rate_key` (`n_components` for everything here), so every method spends
+# the same number of coefficients on the channel.
+symbols: null
+symbol_divisor: 1
+
+# --- preprocessing charts ---------------------------------------------
+# One entry per preprocessing configuration; each is a separate figure
+# family, and the keys are merged into *every* method in the run.
+#
+# Merging into every method is the point rather than a convenience. RKA
+# is Procrustes plus a constrained RKHS residual, so as lambda grows the
+# residual vanishes and the map converges to the Procrustes solution --
+# but to the one fitted on the *same* chart. Read a sweep on a PCA chart
+# against a whitened Procrustes line and the lambda -> infinity limit
+# lands somewhere the curve can never reach, which looks like a failure
+# of the residual stage and is nothing of the kind.
+#
+# Any key a `LatentScaler` takes is allowed: `preprocess`, `eps`,
+# `shrinkage`, and `n_components` (which overrides the rate above for
+# that chart alone). An optional `name` renames the chart in the output
+# tree; otherwise the tag is built from the keys.
+#
+#   whiten -- equalises every retained direction (cov = I). The chart
+#             Procrustes is actually defined on; also the one that tells
+#             a single RBF bandwidth that a direction carrying 1% of the
+#             variance deserves the same treatment as the leading one.
+#   pca    -- the same factorisation stopped one step earlier: rotate
+#             onto the principal axes, leave the variances alone. The
+#             rigid stage should lose something here; the kernel stage
+#             may gain.
+charts:
+  - preprocess: whiten
+  # - preprocess: pca
+
+# --- compression ranks -------------------------------------------------
+# The second axis of the preprocessing grid: how many directions each
+# chart keeps. Every entry of `charts` is measured at every rank, so
+# `charts x ranks` is the figure family and one lambda is measured per
+# (chart, rank, budget) cell -- which is the resolution `pilot_sweep.py`
+# reads it back at.
+#
+# `null` means one rank only, whatever `symbols` / `symbol_divisor`
+# resolves to, and the axis behaves exactly as it did before it existed.
+#
+#   uv run scripts/lambda_sweep.py 'ranks=[0.8, 0.6, 0.2]'
+#
+# An entry is either an integer -- that many symbols outright -- or a
+# float in (0, 1], the fraction of the channel to KEEP, resolved against
+# `max_rank`. So the line above compresses by 20/40/80%, and
+#
+#   uv run scripts/lambda_sweep.py 'ranks=[384, 192, 96, 48]'
+#
+# asks for fixed widths instead. A fraction is resolved to an integer
+# before it reaches a chart, and that matters: `n_components` also takes
+# a float, but there it means *explained variance* -- 0.8 would keep
+# however many directions carry 80% of each space's variance, a
+# different number on each side of the channel and therefore not a rate
+# at all. Both charts have to keep the same k or the run is not
+# rate-matched. The resolved integer is what appears in the slug
+# (`pca-k154`) and in the `symbols` column.
+#
+# The `resolve_symbols` rule applies per rank: a request at or above
+# `max_rank` cannot compress the transmitter, so it is read as no
+# compression and tagged `kfull` rather than throwing away the
+# receiver's surplus directions. Several such requests collapse to the
+# one uncompressed chart instead of refitting it.
+#
+# Each expanded chart is named `<chart>-k<rank>` (`pca-k192`,
+# `whiten-kfull`), because `chart_slug` does not print `n_components` --
+# without a name every rank of one chart would share a figure directory.
+# Setting `n_components` on a `charts` entry while `ranks` is also set
+# is an error: the rank would be ambiguous.
+#
+# The pilot axis below follows the rank: `multipliers` are pilots *per
+# symbol*, so a chart keeping k directions is measured at ceil(k * m).
+# Each rank therefore gets its own budgets, and every cell of the grid is
+# read at the same pilots-per-symbol rather than the same absolute N.
+# Absolute `pilots.counts` still win and still apply to every chart.
+ranks: null
+
+# --- pilot budgets ----------------------------------------------------
+pilots:
+  # Absolute budgets, and they win when set. Left null the axis is
+  # derived as ceil(symbols * m) for each m below -- against the rate
+  # *already resolved* above, never against the literal `symbols: null`
+  # -- so it follows d_r instead of being pinned to one encoder pair:
+  #
+  #   divisor 1, d_r=384  ->  423 500 576 653 768 960 1152 1536 2304 3072 3840
+  #   divisor 2, d_r=384  ->  212 250 288 327 384 480  576  768 1152 1536 1920
+  #   divisor 1, d_r=768  ->  845 999 ... 7680
+  #
+  # Set, they win and apply to every chart unchanged: an axis stated
+  # outright is stated for the whole run. Left null the axis is derived
+  # per chart from `multipliers` against that chart's own rank, so a run
+  # sweeping `ranks` gets one budget axis per rank.
+  counts: null
+
+  # Candidate pool pilots are selected from, per (source, repeat/seed).
+  #
+  # Shared because the lambda measured by one study is applied by the
+  # other, and a lambda measured on pilots herded from 50k rows does not
+  # belong to a run whose pilots were herded from 10k.
+  #
+  # It also has to stay comfortably above the largest budget, or the
+  # design has nothing to choose between. And it is the single biggest
+  # lever on start-up time: kernel herding matches the pool's kernel mean
+  # embedding, which is *quadratic* in the pool -- ~17s over the full
+  # 50k training split against ~0.7s over 10k, paid before a single
+  # aligner is fitted. `null` means the whole split; that also makes
+  # herding return the same pilots every seed, so the deterministic
+  # designs get a zero-width band.
+  pool_size: 50000
+
+  # Pilots per symbol, scaled against the rank each chart actually keeps
+  # -- so with `ranks: [384, 96]` the k384 charts are measured at
+  # 3072..24576 and the k96 ones at 768..6144, and both are read at the
+  # same 8..64 pilots per symbol. That is the comparison the axis is for:
+  # a rate that costs a quarter of the airtime should be calibrated with
+  # a quarter of the pilots, and holding N fixed across ranks instead
+  # would hand the narrow chart eight times the calibration per symbol.
+  #
+  # The top of the range is bounded by the aligner's `max_points` (4000):
+  # past it the kernel stage subsamples while Procrustes still sees every
+  # pilot, so the two stop being asked the same question. The bottom is
+  # bounded by nothing -- budgets under the source width are
+  # rank-deficient by design, and that regime is the subject of the study.
+  multipliers: [8.0, 16.0, 32.0, 64.0]

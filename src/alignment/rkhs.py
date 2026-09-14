@@ -44,6 +44,22 @@ states the same estimator in matrix form. With ``Kc = V diag(s) V^T`` and
     (Kc + N lam I)^-1 = V diag(1 / (s + N lam)) V^T
     H_lam             = V diag(s / (s + N lam)) V^T
 
+The ridge itself is stated in units of the kernel. ``s_i`` carries the
+kernel's scale and ``lam`` does not, so rescaling ``k -> c k`` -- which
+leaves the hypothesis space alone and only relabels its norm -- moves
+every ``s_i`` by ``c`` and makes a fixed ``lam`` grid mean something
+different for every kernel and every bandwidth. ``lam_scaling='trace'``
+divides that constant out by the mean non-zero eigenvalue ``s_mean``, so
+the penalised objective is
+
+    (1/N) ||E - G||_F^2  +  lam * s_mean * ||g||_H^2
+
+with ``lam`` dimensionless. It is exactly kernel ridge on the Gram matrix
+normalised to unit mean eigenvalue, hence a reparametrisation of the
+*same* one-parameter path: every fit reachable under ``'n'`` is reachable
+under ``'trace'`` at ``lam / s_mean``, and the Procrustes limit, the
+capacity argument and the orthogonality constraint are all untouched.
+
 ``V`` does not depend on ``lam``, so ``V^T X`` and ``V^T E`` are computed
 once (this is what :attr:`VtX` and :attr:`VtE` hold) and each grid point
 costs ``O(N d^2)`` instead of an ``O(N^3)`` solve. The reweighting
@@ -88,7 +104,10 @@ class _ResidualSolver:
         center: bool,
         ridge_B: float,
         orthogonal: bool,
+        lam_scaling: str = 'n',
     ) -> None:
+        if lam_scaling not in ('n', 'trace'):
+            raise ValueError(f'Unknown lam_scaling {lam_scaling!r}.')
         self.n, self.d_src = X.shape
         self.X = X
         self.E = E
@@ -96,6 +115,7 @@ class _ResidualSolver:
         self.center = center
         self.ridge_B = float(ridge_B)
         self.orthogonal = bool(orthogonal)
+        self.lam_scaling = lam_scaling
 
         K = kernel(X, X)
         if center:
@@ -178,6 +198,43 @@ class _ResidualSolver:
             else float('inf')
         )
 
+        # Scale of the ridge. In `s_i + N lam` the eigenvalues carry the
+        # kernel's units and `lam` does not: rescaling k -> c*k leaves the
+        # hypothesis space untouched but multiplies every s_i by c, so the
+        # same `lam` grid means something different for every kernel and
+        # every bandwidth. `lam_scaling='trace'` divides it out by the
+        # mean *non-zero* eigenvalue, which is the kernel analogue of
+        # standardising X before a ridge regression -- for the linear
+        # kernel the two are literally the same operation, since tr(Kc)/N
+        # is then the total variance of the cloud.
+        #
+        # Mean eigenvalue on whitened d=48 pilots, N=400:
+        #
+        #   rbf 0.63 | laplacian 0.63 | cosine 1.0 | linear 48 | poly 1.3e5
+        #
+        # so an unnormalised grid topping out at 1e3 never regularises the
+        # polynomial kernel at all (its top mode needs lam ~ 1.8e3) and a
+        # kernel comparison run on one grid compares placement on that
+        # grid, not the kernels. Same effect, milder, along
+        # `bandwidth_scale`: the mean eigenvalue moves 16x from scale 0.25
+        # to 16, dragging the lambda axis under any joint sweep.
+        self.s_mean_ = float(self.s.sum()) / max(self.gram_rank_, 1)
+        self.lam_scale_ = self.s_mean_ if lam_scaling == 'trace' else 1.0
+
+        # s_max / s_mean: how peaked the spectrum is, and the diagnostic
+        # that says whether `lam` has anything to select. It falls towards
+        # 1 as the source dimension grows and pairwise distances
+        # concentrate -- at which point Kc is a nugget, every eigenvalue
+        # is equal, and the sweep is choosing an overall shrinkage of an
+        # essentially white kernel rather than a smooth subspace. Measured
+        # on whitened Gaussian pilots at N=400: 19.9 at d=16, 3.3 at
+        # d=256, 1.9 at d=1024. Widening the bandwidth barely moves it
+        # (1.9 -> 2.6 at d=1024 over scale 1 -> 64); truncating the
+        # whitening rank is the lever that does.
+        self.gram_flatness_ = (
+            float(self.s.max() / self.s_mean_) if self.s_mean_ > 0 else 1.0
+        )
+
         if self.capacity_ <= 0:
             log.warning(
                 'Residual stage has no degrees of freedom: rank(K)=%d, '
@@ -198,20 +255,24 @@ class _ResidualSolver:
         Parameters
         ----------
         lam : float
-            Ridge strength; the effective shift is ``N * lam``, matching
-            ``H = K (K + N lam I)^-1``.
+            Ridge strength. The effective shift is
+            ``N * lam * lam_scale_``, matching ``H = K (K + N lam I)^-1``
+            under ``lam_scaling='n'`` and the same expression on a Gram
+            matrix normalised to unit mean eigenvalue under ``'trace'``.
 
         Returns
         -------
         dict
             ``A`` (dual coefficients, ``(N, d_tgt)``), ``G`` (fitted
-            residual on the calibration points, ``(N, d_tgt)``) and
-            ``dof`` (trace of the smoother, i.e. effective degrees of
-            freedom).
+            residual on the calibration points, ``(N, d_tgt)``), ``dof``
+            (trace of the smoother, i.e. effective degrees of freedom)
+            and ``shift`` (the quantity actually added to the Gram
+            eigenvalues, which is what is comparable across scalings).
         """
         if lam <= 0:
             raise ValueError(f'lam must be strictly positive, got {lam}.')
-        shift = self.s + self.n * lam
+        ridge = self.n * lam * self.lam_scale_
+        shift = self.s + ridge
         h = self.s / shift  # eigenvalues of H_lam
 
         if self.orthogonal:
@@ -230,7 +291,12 @@ class _ResidualSolver:
 
         A = self.V @ (VtM / shift[:, None])
         G = self.V @ (h[:, None] * VtM)
-        return {'A': A, 'G': G, 'dof': float(np.sum(h))}
+        return {
+            'A': A,
+            'G': G,
+            'dof': float(np.sum(h)),
+            'shift': float(ridge),
+        }
 
     def center_cross(self, k: np.ndarray) -> np.ndarray:
         """Centre an out-of-sample cross-kernel block ``(m, N)``.
@@ -280,6 +346,16 @@ class RKHSAligner(Aligner):
         Held-out fraction used for that selection.
     selection : {'nmse', 'cosine'}, default='nmse'
         Criterion optimised over ``lam_grid``.
+    lam_scaling : {'n', 'trace'}, default='n'
+        Units of ``lam``. ``'n'`` is the pipeline's literal convention,
+        shift ``N * lam``. ``'trace'`` additionally divides out the mean
+        non-zero eigenvalue of the centred Gram matrix, so the penalty
+        becomes ``lam * s_mean * ||g||_H^2`` -- i.e. ``lam`` is
+        dimensionless and one grid means the same thing across kernel
+        families and bandwidths, which it does not under ``'n'``. It is a
+        reparametrisation of the same one-parameter path, not a different
+        model: no fit becomes reachable or unreachable, the labels on the
+        axis change.
     center_kernel : bool, default=True
         Double-centre the Gram matrix (strongly recommended: the model
         has no explicit intercept in feature space).
@@ -313,6 +389,7 @@ class RKHSAligner(Aligner):
         lam_grid: list[float] | None = None,
         val_fraction: float = 0.2,
         selection: str = 'nmse',
+        lam_scaling: str = 'n',
         center_kernel: bool = True,
         orthogonal_residual: bool = True,
         ridge_B: float = 1e-8,
@@ -332,6 +409,11 @@ class RKHSAligner(Aligner):
         )
         if selection not in ('nmse', 'cosine'):
             raise ValueError(f'Unknown selection criterion {selection!r}.')
+        if lam_scaling not in ('n', 'trace'):
+            raise ValueError(
+                f'Unknown lam_scaling {lam_scaling!r}; expected "n" or '
+                '"trace".'
+            )
 
         self.kernel_spec = Kernel(
             name=kernel,
@@ -346,6 +428,7 @@ class RKHSAligner(Aligner):
         )
         self.val_fraction = float(val_fraction)
         self.selection = selection
+        self.lam_scaling = lam_scaling
         self.center_kernel = bool(center_kernel)
         self.orthogonal_residual = bool(orthogonal_residual)
         self.ridge_B = float(ridge_B)
@@ -365,6 +448,7 @@ class RKHSAligner(Aligner):
             lam=self.lam,
             lam_grid=self.lam_grid,
             selection=self.selection,
+            lam_scaling=self.lam_scaling,
             center_kernel=self.center_kernel,
             orthogonal_residual=self.orthogonal_residual,
             ridge_B=self.ridge_B,
@@ -430,6 +514,7 @@ class RKHSAligner(Aligner):
             center=self.center_kernel,
             ridge_B=self.ridge_B,
             orthogonal=self.orthogonal_residual,
+            lam_scaling=self.lam_scaling,
         )
         solution = self._solver.solve(self.lam_)
         self.A_ = solution['A']
@@ -469,15 +554,22 @@ class RKHSAligner(Aligner):
             center=self.center_kernel,
             ridge_B=self.ridge_B,
             orthogonal=self.orthogonal_residual,
+            lam_scaling=self.lam_scaling,
         )
         k_val = solver.center_cross(self.kernel_spec(X[val_idx], X[fit_idx]))
 
         self.lambda_path_ = []
         for lam in self.lam_grid:
-            G_val = k_val @ solver.solve(lam)['A']
+            point = solver.solve(lam)
+            G_val = k_val @ point['A']
             self.lambda_path_.append(
                 {
                     'lam': float(lam),
+                    # The shift actually added to the Gram eigenvalues and
+                    # the resulting smoother trace. These, not `lam`, are
+                    # what compare across kernels, bandwidths and budgets.
+                    'shift': point['shift'],
+                    'dof': point['dof'],
                     'val_nmse': _nmse(G_val, E_val),
                     'val_cosine': _mean_cosine(G_val, E_val),
                 }
@@ -510,6 +602,11 @@ class RKHSAligner(Aligner):
         norm_X = float(np.linalg.norm(X))
         self.diagnostics_ = {
             'rkhs_lam': self.lam_,
+            'rkhs_lam_scaling': self.lam_scaling,
+            # N * lam * lam_scale_: the quantity actually added to the
+            # Gram eigenvalues. `rkhs_lam` alone is not comparable across
+            # kernels, bandwidths or scalings; this is.
+            'rkhs_lam_effective': solution['shift'],
             'rkhs_dof': solution['dof'],
             'rkhs_n_kernel_points': int(X.shape[0]),
             # Should be ~0 (the constant direction that centring removes).
@@ -519,6 +616,13 @@ class RKHSAligner(Aligner):
             # ratio is meaningless because centring always leaves a zero.
             'rkhs_gram_cond': self._solver.gram_cond_,
             'rkhs_gram_rank': self._solver.gram_rank_,
+            # Mean non-zero Gram eigenvalue, and s_max over it. Flatness
+            # near 1 means the kernel has degenerated to a nugget under
+            # distance concentration: every eigenvalue is equal, so `lam`
+            # selects an overall shrinkage rather than a smooth subspace
+            # and any RKA gain is interpolation of the pilots.
+            'rkhs_gram_s_mean': self._solver.s_mean_,
+            'rkhs_gram_flatness': self._solver.gram_flatness_,
             # rank(K) - rank(X): the residual's degrees of freedom. Zero
             # or less means RKA is exactly Procrustes.
             'rkhs_capacity': self._solver.capacity_,
@@ -536,6 +640,52 @@ class RKHSAligner(Aligner):
         }
         if self.lambda_path_:
             self.diagnostics_['rkhs_lam_grid_size'] = len(self.lambda_path_)
+
+    def set_lam(self, lam: float) -> RKHSAligner:
+        """Re-solve the residual stage at another ``lam``, keeping the rest.
+
+        Nothing a fit computes before the ridge depends on ``lam``: the
+        rigid stage, the bandwidth, the kernel points, and the centred
+        Gram matrix with its ``O(N^3)`` eigendecomposition are all the
+        same at every value. So a sweep over ``lam`` needs one fit and
+        then one ``O(N d^2)`` solve per value, and each result is the fit
+        that ``lam`` would have produced from scratch -- the same solver
+        on the same eigenbasis, only the shift changed.
+
+        The held-out selection path, if the fit ran one, no longer
+        describes this model and is cleared.
+
+        Parameters
+        ----------
+        lam : float
+            The new ridge, in the units of ``lam_scaling``.
+
+        Returns
+        -------
+        RKHSAligner
+            ``self``.
+        """
+        self._check_fitted()
+        solution = self._solver.solve(float(lam))
+        self.lam = self.lam_ = float(lam)
+        self.lambda_path_ = []
+        self.A_ = solution['A']
+
+        G, E, X = solution['G'], self._solver.E, self._X_kernel
+        self.diagnostics_.update(
+            {
+                'rkhs_lam': self.lam_,
+                'rkhs_lam_effective': solution['shift'],
+                'rkhs_dof': solution['dof'],
+                'rkhs_residual_r2': 1.0 - _nmse(G, E),
+                'rkhs_orthogonality': float(
+                    np.linalg.norm(G.T @ X)
+                    / max(np.linalg.norm(G) * np.linalg.norm(X), 1e-12)
+                ),
+            }
+        )
+        self.diagnostics_.pop('rkhs_lam_grid_size', None)
+        return self
 
     # ------------------------------------------------------------------
     # Transform

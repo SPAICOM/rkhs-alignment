@@ -1,6 +1,6 @@
 """RKA against the alignment methods of the literature, at a fixed budget.
 
-The companion to ``pilot_efficiency.py``, with the axes swapped. There the
+The companion to ``pilot_sweep.py``, with the axes swapped. There the
 pilot budget varies and the method field is small; here the budget is
 *pinned* and the whole field of published alignment methods is run on it,
 so what the figure ranks is the methods themselves rather than their

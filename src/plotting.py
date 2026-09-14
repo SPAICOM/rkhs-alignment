@@ -28,11 +28,14 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     'METHOD_COLORS',
+    'plot_budget_selection',
     'plot_compression_facets',
     'plot_compression_study',
+    'plot_dimension_sweep',
     'plot_kernel_study',
     'plot_method_comparison',
     'plot_pilot_efficiency',
+    'plot_regularization_metric',
     'plot_regularization_study',
     'use_project_style',
 ]
@@ -41,13 +44,42 @@ __all__ = [
 # dE 9.2, normal-vision dE 16.3.
 _PALETTE: tuple[str, ...] = ('#2a78d6', '#eb6834', '#1baf7a', '#4a3aa7')
 
+# Two hues past the four, for methods that share a figure with Procrustes
+# and RKA but must not borrow a slot that means something else in another
+# figure. Each was validated against the figure it appears in (all pairs,
+# OKLab dE x100, Machado CVD simulation):
+#
+#   pink          with procrustes, rkhs, residual_mlp  CVD 11.9  normal 15.4
+#   golden yellow with procrustes, rkhs, cca           CVD  9.2  normal 15.1
+#
+# To a protan or deutan reader a yellow and RKA's orange differ only in
+# lightness, so every yellow between OKLCH L ~0.58 and ~0.74 collapses
+# into the orange (dE 1.6-3.1 for #c98500..#a67c00). The separation has
+# to come from one end of the band: #806a00 (L 0.53) clears it dark, this
+# step (L 0.77) clears it light. Light is the one that still reads as
+# yellow; its cost is 2.1:1 contrast on the surface, which is why it also
+# gets its own dash and marker in `_METHOD_STYLES`.
+_PINK = '#c94f8b'
+_GOLDEN_YELLOW = '#e2a821'
+
 # Colour belongs to the method, not to its position in a given run: a
 # figure that drops one method must not repaint the others.
 METHOD_COLORS: dict[str, str] = {
     'procrustes': _PALETTE[0],
     'rkhs': _PALETTE[1],
-    'direct_mlp': _PALETTE[2],
+    'cca': _PALETTE[2],
     'residual_mlp': _PALETTE[3],
+    'direct_mlp': _PINK,
+    'ppfe': _GOLDEN_YELLOW,
+}
+
+# A method whose hue needs a second channel to be told apart, drawn with
+# its own dash and marker wherever the figure would otherwise give it the
+# style of its neighbour. Proto-PFE's yellow is the palette's lowest-contrast
+# mark and its nearest neighbour is RKA's orange, and both would otherwise
+# take the first style slot.
+_METHOD_STYLES: dict[str, tuple[str, str]] = {
+    'ppfe': ('-.', 'D'),
 }
 
 # Second channel: the pilot-selection strategy.
@@ -80,14 +112,40 @@ _PRETTY = {
 }
 
 
-def use_project_style(style_path: str | Path | None = None) -> None:
+def _with_extension(out_path: Path, ext: str) -> Path:
+    """``<stem>.<ext>``, appending rather than replacing a suffix.
+
+    ``Path.with_suffix`` replaces everything after the *last* dot, which
+    silently truncates a destination stem that carries one -- and these
+    stems are named after the run that produced them, so a lambda grid
+    written `lam1e-08to1000` is one edit away from putting a dot in every
+    figure name. Callers pass a stem, never a filename with an extension,
+    so appending is always what was meant.
+    """
+    return out_path.with_name(f'{out_path.name}.{ext}')
+
+
+def use_project_style(
+    style_path: str | Path | None = None, backend: str | None = 'Agg'
+) -> None:
     """Apply the repo's matplotlib style, without requiring LaTeX.
 
     ``config/plotting/plt.mplstyle`` sets ``text.usetex: True``, which
     raises at render time on a machine with no TeX installation. The
     style is applied either way and that one key is turned back off when
     TeX is missing.
+
+    ``backend`` defaults to ``'Agg'`` because these are batch scripts
+    that write files and display nothing, while matplotlib on macOS
+    otherwise picks the ``macosx`` GUI backend and draws through AppKit.
+    One crash report from a sweep run does show the interpreter dying
+    inside ``NSPDFImageRep``, so a GUI backend is worth avoiding here --
+    though it is not the whole story: these runs still segfault
+    intermittently under ``Agg``. Pass ``backend=None`` to leave the
+    choice alone, e.g. when plotting interactively in a notebook.
     """
+    if backend is not None and mpl.get_backend().lower() != backend.lower():
+        plt.switch_backend(backend)
     if style_path is not None and Path(style_path).exists():
         plt.style.use(str(style_path))
     if mpl.rcParams.get('text.usetex') and which('latex') is None:
@@ -163,7 +221,7 @@ def plot_pilot_efficiency(
                 color=_MUTED,
                 fontsize=12,
             )
-        for index, method in enumerate(methods):
+        for method in methods:
             for strategy in strategies:
                 rows = sorted(
                     (
@@ -184,11 +242,13 @@ def plot_pilot_efficiency(
                     if len(strategies) > 1
                     else _label(method)
                 )
-                # Series drawn earlier get a slightly wider line, so a
-                # pair that coincides exactly (which is the expected
-                # result below the feasibility threshold) still reads as
-                # two curves rather than one.
-                width = 2.0 + 1.8 * (len(methods) - 1 - index)
+                # One weight for every series. Earlier versions widened
+                # the ones drawn first so that two exactly coinciding
+                # curves still read as two, but with more than a couple
+                # of methods the gradient reads as emphasis instead --
+                # and it is hue and dash, not weight, that carry identity
+                # here. Coincidence is now left to the markers, which
+                # sit at different points along the line.
                 ax.plot(
                     x,
                     mu,
@@ -196,8 +256,8 @@ def plot_pilot_efficiency(
                     marker=marker,
                     color=colors[method],
                     label=label,
-                    linewidth=width,
-                    markersize=8 + 3 * (len(methods) - 1 - index),
+                    linewidth=2.0,
+                    markersize=8,
                     markeredgecolor=_SURFACE,
                     markeredgewidth=1.2,
                 )
@@ -268,7 +328,181 @@ def plot_pilot_efficiency(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = []
     for ext in formats:
-        path = out_path.with_suffix(f'.{ext}')
+        path = _with_extension(out_path, ext)
+        fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
+        written.append(path)
+    plt.close(fig)
+    return written
+
+
+def plot_dimension_sweep(
+    summary: list[dict[str, Any]],
+    metrics: list[str],
+    out_path: str | Path,
+    reference: dict[str, float] | None = None,
+    hue_of: dict[str, str] | None = None,
+    title: str | None = None,
+    formats: tuple[str, ...] = ('png', 'pdf'),
+) -> list[Path]:
+    """Plot each metric against the compression dimension, at one budget.
+
+    The counterpart of :func:`plot_pilot_efficiency` along the other
+    axis: the pilot budget is held fixed and the number of transmitted
+    symbols moves. One panel per metric, because accuracy and MRR live on
+    different scales and a shared axis would flatten one of them.
+
+    Colour is the method *family* and line style separates its members,
+    as in :func:`plot_compression_facets`: SVCCA is CCA after an SVD, and
+    sharing a hue is what makes that relation readable.
+
+    Parameters
+    ----------
+    summary : list[dict]
+        One row per ``(method, symbols)``, carrying every metric. The x
+        position is ``symbols``, the rate the method actually delivered.
+        A row carries either ``metric`` itself or ``f'{metric}_mean'``
+        with an optional ``f'{metric}_std'``, drawn as a +/- 1 sd band --
+        the form an average over encoder pairs comes in.
+    metrics : list[str]
+        Metrics to panel, in order.
+    out_path : str | Path
+        Destination stem; one file per entry of ``formats``.
+    reference : dict[str, float], optional
+        Horizontal reference per metric (the receiver's native accuracy).
+    hue_of : dict[str, str], optional
+        ``method -> hue owner``.
+    title : str, optional
+        Figure title.
+    formats : tuple[str, ...], default=('png', 'pdf')
+        Extensions to write.
+
+    Returns
+    -------
+    list[Path]
+        The files written.
+    """
+    hue_of = hue_of or {}
+    methods = _ordered(summary, 'method')
+    colors = _assign_colors(
+        list(dict.fromkeys(hue_of.get(m, m) for m in methods))
+    )
+    styles: dict[str, tuple[str, str]] = {}
+    for method in methods:
+        hue = hue_of.get(method, method)
+        taken = sum(1 for m in styles if hue_of.get(m, m) == hue)
+        styles[method] = _METHOD_STYLES.get(
+            method, _STRATEGY_STYLES[taken % len(_STRATEGY_STYLES)]
+        )
+    rates = sorted({int(r['symbols']) for r in summary})
+
+    fig, axes = plt.subplots(
+        1, len(metrics), figsize=(9.0 * len(metrics), 7.0), squeeze=False
+    )
+    fig.patch.set_facecolor(_SURFACE)
+
+    for ax, metric in zip(axes[0], metrics):
+        ax.set_facecolor(_SURFACE)
+        averaged = any(f'{metric}_mean' in r for r in summary)
+        key = f'{metric}_mean' if averaged else metric
+        for method in methods:
+            rows = sorted(
+                (
+                    r
+                    for r in summary
+                    if r['method'] == method and r.get(key) is not None
+                ),
+                key=lambda r: r['symbols'],
+            )
+            if not rows:
+                continue
+            line, marker = styles[method]
+            x = np.array([r['symbols'] for r in rows], dtype=float)
+            mu = np.array([r[key] for r in rows], dtype=float)
+            if averaged:
+                sd = np.array(
+                    [r.get(f'{metric}_std') or 0.0 for r in rows], dtype=float
+                )
+                ax.fill_between(
+                    x,
+                    mu - sd,
+                    mu + sd,
+                    color=colors[hue_of.get(method, method)],
+                    alpha=0.12,
+                    linewidth=0,
+                )
+            ax.plot(
+                x,
+                mu,
+                line,
+                marker=marker,
+                color=colors[hue_of.get(method, method)],
+                label=_label(method),
+                linewidth=2.0,
+                markersize=8,
+                markeredgecolor=_SURFACE,
+                markeredgewidth=1.2,
+            )
+
+        if reference and metric in reference:
+            ax.axhline(
+                reference[metric],
+                linestyle=(0, (1, 3)),
+                color=_MUTED,
+                linewidth=1.6,
+            )
+            ax.annotate(
+                'native RX',
+                xy=(0.0, reference[metric]),
+                xycoords=('axes fraction', 'data'),
+                xytext=(4, 5),
+                textcoords='offset points',
+                ha='left',
+                color=_MUTED,
+                fontsize=13,
+            )
+
+        # Ranks are geometric; a linear axis crushes the small ones.
+        ax.set_xscale('log', base=2)
+        ticks: list[int] = []
+        for value in rates:
+            if not ticks or value >= ticks[-1] * 1.25:
+                ticks.append(value)
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([str(t) for t in ticks])
+        ax.minorticks_off()
+        ax.set_xlabel('Transmitted symbols $k$', color=_INK)
+        ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
+        ax.grid(True, color=_GRID, linewidth=0.8)
+        ax.set_axisbelow(True)
+        for side in ('top', 'right'):
+            ax.spines[side].set_visible(False)
+        for side in ('left', 'bottom'):
+            ax.spines[side].set_color('#d8d7d2')
+        ax.tick_params(colors=_MUTED, labelsize=14)
+        ax.xaxis.label.set_fontsize(16)
+        ax.yaxis.label.set_fontsize(16)
+
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        fontsize=13,
+        labelcolor=_INK,
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.0),
+        ncol=min(len(labels), 4),
+    )
+    legend_rows = int(np.ceil(len(labels) / min(len(labels), 4)))
+    if title:
+        fig.suptitle(title, color=_INK, fontsize=18)
+    fig.tight_layout(rect=(0, 0.035 * legend_rows + 0.02, 1, 1))
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    for ext in formats:
+        path = _with_extension(out_path, ext)
         fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
         written.append(path)
     plt.close(fig)
@@ -317,7 +551,9 @@ def _label(name: str) -> str:
         'cca': 'CCA',
         'svcca': 'SVCCA',
         'kcca': 'KCCA',
+        'cka': 'CKA matching',
         'pca_rkhs': 'PCA-RKA',
+        'pca_procrustes': 'PCA-Procrustes',
         'pga_procrustes': 'PGA-Procrustes',
         'relative': 'Relative rep.',
         'rr': 'RR (inverse proj.)',
@@ -482,7 +718,284 @@ def plot_regularization_study(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = []
     for ext in formats:
-        path = out_path.with_suffix(f'.{ext}')
+        path = _with_extension(out_path, ext)
+        fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
+        written.append(path)
+    plt.close(fig)
+    return written
+
+
+def plot_regularization_metric(
+    curves: list[dict[str, Any]],
+    metric: str,
+    out_path: str | Path,
+    baselines: dict[str, dict[str, float]] | None = None,
+    reference: dict[str, float] | None = None,
+    title: str | None = None,
+    method: str = 'pca_rkhs',
+    labels: dict[str, str] | None = None,
+    formats: tuple[str, ...] = ('png', 'pdf'),
+) -> list[Path]:
+    """One metric against the RKHS regularisation, on its own figure.
+
+    The same reading as :func:`plot_regularization_study` -- the swept
+    method curves over ``lam``, the baselines are flat because none of
+    them depends on it -- but written one metric per file, for studies
+    that report each panel as a figure in its own right.
+
+    Parameters
+    ----------
+    curves : list[dict]
+        One row per ``lam``, with ``lam`` and ``f'{metric}_mean'`` /
+        ``f'{metric}_std'`` keys.
+    metric : str
+        The metric to plot.
+    out_path : str | Path
+        Destination stem; one file per entry of ``formats``.
+    baselines : dict[str, dict[str, float]], optional
+        ``{method: {metric: value}}``, drawn as horizontal lines.
+    reference : dict[str, float], optional
+        Receiver's native performance, drawn as a dotted rule.
+    title : str, optional
+        Figure title.
+    method : str, default='pca_rkhs'
+        Name of the swept method, for its colour and legend label.
+    labels : dict[str, str], optional
+        Legend text per series name, overriding the default label. The
+        name still picks the colour, so this renames a series without
+        moving its hue.
+    formats : tuple[str, ...], default=('png', 'pdf')
+        Extensions to write.
+
+    Returns
+    -------
+    list[Path]
+        The files written.
+    """
+    baselines = baselines or {}
+    labels = labels or {}
+    rows = sorted(curves, key=lambda r: r['lam'])
+    lam = np.array([r['lam'] for r in rows], dtype=float)
+    colors = _assign_colors([method, *baselines])
+    legend = lambda name: labels.get(name, _label(name))  # noqa: E731
+
+    fig, ax = plt.subplots(figsize=(9.0, 7.0))
+    fig.patch.set_facecolor(_SURFACE)
+    ax.set_facecolor(_SURFACE)
+
+    mu = np.array([r[f'{metric}_mean'] for r in rows])
+    sd = np.array([r.get(f'{metric}_std', 0.0) for r in rows])
+    ax.plot(
+        lam,
+        mu,
+        '-',
+        marker='o',
+        color=colors[method],
+        label=legend(method),
+        linewidth=2.0,
+        markersize=8,
+        markeredgecolor=_SURFACE,
+        markeredgewidth=1.2,
+    )
+    ax.fill_between(
+        lam, mu - sd, mu + sd, color=colors[method], alpha=0.12, linewidth=0
+    )
+
+    for name, values in baselines.items():
+        if metric in values:
+            ax.axhline(
+                values[metric],
+                linestyle='--',
+                color=colors[name],
+                linewidth=2.0,
+                label=legend(name),
+            )
+
+    if reference and metric in reference:
+        ax.axhline(
+            reference[metric],
+            linestyle=(0, (1, 3)),
+            color=_MUTED,
+            linewidth=1.6,
+        )
+        ax.annotate(
+            'native RX',
+            xy=(0.0, reference[metric]),
+            xycoords=('axes fraction', 'data'),
+            xytext=(4, 5),
+            textcoords='offset points',
+            ha='left',
+            color=_MUTED,
+            fontsize=13,
+        )
+
+    best = rows[int(np.argmax(mu))]
+    ax.axvline(best['lam'], color=_MUTED, linewidth=1.0, alpha=0.5)
+    ax.annotate(
+        rf'best $\lambda$ = {best["lam"]:.3g}',
+        xy=(best['lam'], mu.max()),
+        xytext=(6, -14),
+        textcoords='offset points',
+        color=_MUTED,
+        fontsize=13,
+    )
+
+    ax.set_xscale('log')
+    ax.set_xlabel(r'RKHS regularisation $\lambda$', color=_INK)
+    ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
+    ax.grid(True, color=_GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ('top', 'right'):
+        ax.spines[side].set_visible(False)
+    for side in ('left', 'bottom'):
+        ax.spines[side].set_color('#d8d7d2')
+    ax.tick_params(colors=_MUTED, labelsize=14)
+    ax.xaxis.label.set_fontsize(16)
+    ax.yaxis.label.set_fontsize(16)
+
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        fontsize=13,
+        labelcolor=_INK,
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.0),
+        ncol=min(len(labels), 4),
+    )
+    if title:
+        fig.suptitle(title, color=_INK, fontsize=18)
+    fig.tight_layout(rect=(0, 0.09, 1, 1))
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    for ext in formats:
+        path = _with_extension(out_path, ext)
+        fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
+        written.append(path)
+    plt.close(fig)
+    return written
+
+
+def plot_budget_selection(
+    records: list[dict[str, Any]],
+    metric: str,
+    out_path: str | Path,
+    baseline_key: str | None = None,
+    title: str | None = None,
+    formats: tuple[str, ...] = ('png', 'pdf'),
+) -> list[Path]:
+    """Best-``lambda`` performance against the pilot budget, per rate.
+
+    One line per rate (``symbols``), plotted against pilots-per-symbol,
+    so the question "how much calibration does this rate actually need"
+    is read off directly. Each rate's own flat reference is drawn in the
+    same hue, dashed: the gap between the pair is what the residual
+    stage is worth at that budget, and comparing a rate against another
+    rate's reference would not mean anything.
+
+    Parameters
+    ----------
+    records : list[dict]
+        One row per configuration, carrying ``symbols``,
+        ``pilots_per_symbol``, ``n_pilots``, ``f'{metric}'`` and
+        optionally ``baseline_key``.
+    metric : str
+        Metric to plot, already reduced to its best-``lambda`` value.
+    out_path : str | Path
+        Destination stem.
+    baseline_key : str, optional
+        Key holding the flat reference for each row.
+    title : str, optional
+        Figure title.
+    formats : tuple[str, ...], default=('png', 'pdf')
+        Extensions to write.
+
+    Returns
+    -------
+    list[Path]
+        The files written.
+    """
+    rates = sorted({int(r['symbols']) for r in records}, reverse=True)
+    colors = dict(zip([f'k{r}' for r in rates], _PALETTE))
+
+    fig, ax = plt.subplots(figsize=(9.0, 7.0))
+    fig.patch.set_facecolor(_SURFACE)
+    ax.set_facecolor(_SURFACE)
+
+    for rate in rates:
+        rows = sorted(
+            (r for r in records if int(r['symbols']) == rate),
+            key=lambda r: float(r['pilots_per_symbol']),
+        )
+        if not rows:
+            continue
+        color = colors[f'k{rate}']
+        x = np.array([float(r['pilots_per_symbol']) for r in rows])
+        y = np.array([float(r[metric]) for r in rows])
+        ax.plot(
+            x,
+            y,
+            '-',
+            marker='o',
+            color=color,
+            label=f'{rate} symbols',
+            linewidth=2.0,
+            markersize=8,
+            markeredgecolor=_SURFACE,
+            markeredgewidth=1.2,
+        )
+        if baseline_key and baseline_key in rows[0]:
+            ax.plot(
+                x,
+                np.array([float(r[baseline_key]) for r in rows]),
+                '--',
+                color=color,
+                linewidth=1.6,
+                alpha=0.7,
+            )
+
+    ax.set_xlabel('Pilots per symbol', color=_INK)
+    ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
+    ax.grid(True, color=_GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ('top', 'right'):
+        ax.spines[side].set_visible(False)
+    for side in ('left', 'bottom'):
+        ax.spines[side].set_color('#d8d7d2')
+    ax.tick_params(colors=_MUTED, labelsize=14)
+    ax.xaxis.label.set_fontsize(16)
+    ax.yaxis.label.set_fontsize(16)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if baseline_key:
+        handles.append(
+            mpl.lines.Line2D(
+                [], [], linestyle='--', color=_MUTED, linewidth=1.6
+            )
+        )
+        labels.append('Procrustes, same rate')
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        fontsize=13,
+        labelcolor=_INK,
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.0),
+        ncol=min(len(labels), 4),
+    )
+    if title:
+        fig.suptitle(title, color=_INK, fontsize=18)
+    fig.tight_layout(rect=(0, 0.09, 1, 1))
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    for ext in formats:
+        path = _with_extension(out_path, ext)
         fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
         written.append(path)
     plt.close(fig)
@@ -638,7 +1151,7 @@ def plot_method_comparison(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = []
     for ext in formats:
-        path = out_path.with_suffix(f'.{ext}')
+        path = _with_extension(out_path, ext)
         fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
         written.append(path)
     plt.close(fig)
@@ -773,7 +1286,7 @@ def plot_kernel_study(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = []
     for ext in formats:
-        path = out_path.with_suffix(f'.{ext}')
+        path = _with_extension(out_path, ext)
         fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
         written.append(path)
     plt.close(fig)
@@ -958,7 +1471,7 @@ def plot_compression_study(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = []
     for ext in formats:
-        path = out_path.with_suffix(f'.{ext}')
+        path = _with_extension(out_path, ext)
         fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
         written.append(path)
     plt.close(fig)
@@ -1026,7 +1539,9 @@ def plot_compression_facets(
     for method in methods:
         hue = hue_of.get(method, method)
         taken = sum(1 for m in styles if hue_of.get(m, m) == hue)
-        styles[method] = _STRATEGY_STYLES[taken % len(_STRATEGY_STYLES)]
+        styles[method] = _METHOD_STYLES.get(
+            method, _STRATEGY_STYLES[taken % len(_STRATEGY_STYLES)]
+        )
 
     fig, axes = plt.subplots(
         1,
@@ -1111,7 +1626,7 @@ def plot_compression_facets(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = []
     for ext in formats:
-        path = out_path.with_suffix(f'.{ext}')
+        path = _with_extension(out_path, ext)
         fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
         written.append(path)
     plt.close(fig)

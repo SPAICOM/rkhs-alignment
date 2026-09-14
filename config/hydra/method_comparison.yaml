@@ -1,6 +1,6 @@
 # RKA against the alignment methods of the literature, at a fixed budget.
 #
-# The companion to pilot_efficiency.yaml with the axes swapped: there the
+# The companion to pilot_sweep.yaml with the axes swapped: there the
 # pilot budget sweeps and the method field is small, here the budget is
 # *pinned* and the whole published field runs on it. Every method sees the
 # same pilot sets, so the ranking is about the methods and not about which
@@ -29,6 +29,7 @@ defaults:
   - alignment@methods.kcca: kcca         # Huang et al.'s kernel CCA
   - alignment@methods.rr: rr
   - alignment@methods.ppfe: ppfe
+  - alignment@methods.cka: cka         # Maniparambil et al.'s CKA matching
   - _self_
 
 seed: 42
@@ -81,9 +82,10 @@ pilots:
   #   l_ortho, cca, kcca                         least-squares design
   #                                              matrix wants a sample
   #                                              that represents the pool)
-  #   ppfe, relative                   kmeans    (matching the k-means
-  #                                              prototypical anchors the
-  #                                              frame is built from)
+  #   ppfe, relative, cka              kmeans    (matching the k-means
+  #                                              prototypical anchors, or
+  #                                              base set, each one is
+  #                                              built from)
   #   rr                               fps       (its own refinement step
   #                                              is FPS under the |cosine|
   #                                              distance, so the pilots

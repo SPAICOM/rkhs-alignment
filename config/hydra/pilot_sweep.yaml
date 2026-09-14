@@ -1,0 +1,212 @@
+# Figure (ii): RKA against Procrustes and the neural baselines, over the
+# pilot budget.
+#
+# One figure, one panel per metric (accuracy, MRR), each plotting the
+# field against the number of semantic pilots N. Colour is the method,
+# line style is the pilot design, and the band is +/- 1 sd over the seeds.
+#
+# Nothing here is left to an inner selection:
+#
+#   - the rate is pinned (`symbols`), written into whichever knob each
+#     preset declares, so every method spends the same airtime;
+#   - RKA's lambda is not selected per fit but *read back* per budget from
+#     the CSVs `lambda_sweep.py` wrote, at the same chart and the same
+#     rate. Selecting it on a held-out slice of the pilots is itself
+#     sample-inefficient, and at small budgets that would show up as a
+#     property of RKA rather than of the selection rule.
+#
+# So `just lambda-sweep` has to have run first, on the same axes -- which
+# is what `axes/default.yaml` exists to guarantee.
+#
+#   just pilot-sweep
+#   uv run scripts/pilot_sweep.py 'seeds=[0, 1, 2]'
+#   uv run scripts/pilot_sweep.py 'charts=[{preprocess: pca}]'
+#   uv run scripts/pilot_sweep.py data=semasia_mnist
+#   uv run scripts/pilot_sweep.py plot_only=true 'drop=[direct_mlp]'
+
+defaults:
+  - axes: default
+  - data: semasia
+  # Order matters twice: it is the order the methods are fitted in, and
+  # the order the figure assigns hues in. Procrustes first so it takes
+  # the slot it holds in every other figure, RKA second.
+  - alignment@methods.procrustes: procrustes
+  - alignment@methods.rkhs: rkhs
+  - alignment@methods.direct_mlp: direct_mlp
+  - alignment@methods.residual_mlp: residual_mlp
+  - _self_
+
+# --- realisations -----------------------------------------------------
+# One entry per independent realisation: it draws the candidate pool, it
+# drives the randomised pilot designs, and it seeds the neural baselines'
+# initialisation. Each writes its own records CSV as it finishes, so a
+# run that dies costs one seed rather than the grid.
+seeds: [0, 1, 2, 3, 4]
+
+# Base seed for everything outside the per-realisation loop.
+seed: 0
+
+# --- encoder pairs ----------------------------------------------------
+# Star topology: every other encoder transmits into one receiver.
+#
+# `receiver: null` does not mean "the first model listed" -- it means the
+# *widest* agent available, resolved by measuring them. The receiver's
+# latent space is where every transported latent has to land, so a narrow
+# receiver caps what the channel can carry for every method at once and
+# the comparison starts measuring the receiver instead of the alignment.
+# Uncommenting a wider encoder in the data config therefore moves the
+# receiver to it, with no other edit.
+#
+# Pin one explicitly to override the rule, or give `pairs` outright:
+#
+#   receiver: vit_small_patch16_224.augreg_in1k
+#   pairs: [{source: regnety_016.pycls_in1k, target: ...}]
+#
+# The resolved direction and both widths are logged at the top of a run.
+pairs: null
+receiver: null
+max_pairs: 4
+
+# --- pilot budgets and designs ----------------------------------------
+# `counts` / `multipliers` come from `axes/default.yaml`, shared with the
+# lambda sweep so every budget here has a lambda measured at exactly that
+# budget rather than interpolated to it.
+pilots:
+  # Colour is the method, line style is the design.
+  #   stratified -> one quota per class, randomised within the class
+  #   herding    -> kernel herding, the RKA paper's kernel-aware design
+  strategies: [stratified, herding]
+
+  # `pool_size` comes from `axes/default.yaml`, shared with the lambda
+  # sweep. Re-drawn per seed here, which is what gives kernel herding --
+  # deterministic over a fixed pool -- an error bar that means the same
+  # thing as every other design's.
+
+# --- lambda schedule --------------------------------------------------
+# Read back from the lambda sweep rather than swept again: it already
+# paid for these numbers. For each (chart, rate, budget) the schedule
+# takes the lambda maximising `metric` in the matching CSV.
+#
+# The match is on the CSV's *columns*, not on its filename, so renaming
+# an output cannot silently change which lambda is used.
+#
+# Set `enabled: false` to fall back to whatever each preset declares
+# (which for `rkhs` means its own held-out selection over `lam_grid`).
+lam_schedule:
+  enabled: true
+  methods: [rkhs]
+  study: lambda_sweep
+  metric: accuracy
+
+  # A budget with no measured lambda falls back to the nearest studied
+  # budget in log space, with a warning. false raises instead.
+  nearest: true
+
+# --- calibration regime -----------------------------------------------
+# Whether each device may standardise from all of its local data (free,
+# no airtime) or only from the pilots.
+#
+# `false` -- the default -- is not the generous setting, it is the
+# *consistent* one: the lambda schedule above was measured by
+# `lambda_sweep.py`, which fits the chart on the pilots alone. Turning
+# this on changes the conditioning of the chart and the measured lambda
+# no longer belongs to the run it is being used in. Turn it on only
+# alongside `lam_schedule.enabled=false`.
+use_local_context: false
+
+# --- receiver decoder -------------------------------------------------
+decoder:
+  enabled: true
+  # The receiver's task head, fitted on its own raw latents and never on
+  # a transported one.
+  #
+  # `mlp`, not `linear`, and the reason is specific to this encoder pair.
+  # A linear probe makes `decoder(align(x))` an *affine* classifier on the
+  # transmitter's latent, so post-alignment accuracy is capped by the best
+  # affine classifier the transmitter admits -- 0.9207 here, above the
+  # receiver's own 0.9120, because vit_small is the better CIFAR-10
+  # encoder. Both methods then sit on that cap and their accuracy ordering
+  # is noise: measured at N=400/800/1536 the linear head ranks RKA *below*
+  # Procrustes (-0.0006/-0.0004/-0.0003) while MRR, which uses no decoder
+  # at all, ranks it above (+0.0014/+0.0077/+0.0078).
+  #
+  # The MLP head lifts the receiver's own accuracy to 0.9228, back above
+  # the transmitter's affine cap, so "native RX" is a ceiling again and
+  # nothing transported beats it. It also ranks the methods the way the
+  # decoder-free metric does (+0.0010/+0.0008/+0.0008).
+  #
+  # The cost is real and worth knowing: an expressive head partly rescues
+  # a badly fitted map, so it compresses the pilot axis. Over N=50..1536
+  # the linear head spans 0.797..0.902 and the MLP only 0.823..0.902 --
+  # low budgets look better than they are. Switch back with
+  # `decoder.kind=linear` when the question is how much a pilot is worth
+  # rather than which map is better.
+  kind: mlp
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+# --- evaluation -------------------------------------------------------
+eval:
+  # One panel per entry, in this order.
+  metrics: [accuracy, mrr]
+  topk: [1, 5]
+
+# Curves to leave off the figure without re-running anything; the records
+# keep them, so adding one back is a `plot_only=true` redraw.
+#
+# A bare method leaves it out of every design; `method:design` leaves out
+# one curve and keeps the method's others. The second form is what puts
+# both designs on the kernel methods and one on the neural baselines --
+# the eight curves of the full grid are more than a panel can carry:
+#
+#   drop: [direct_mlp, residual_mlp]                  # kernel methods only
+#   drop: [direct_mlp:stratified, residual_mlp:stratified]
+#
+# Unknown names are an error rather than a silent no-op.
+drop: []
+
+# --- output -----------------------------------------------------------
+# The figure lands at
+#   <figures>/<study>/<dataset>/<chart>/<stem>.{pdf,png}
+# the per-seed records at
+#   <results>/<study>/<dataset>/<stem>_seed<k>.csv
+# and the reduced curves at <results>/<study>/<dataset>/<stem>.csv.
+output:
+  study: pilot_sweep
+  figures: figures
+  results: results
+  formats: [pdf, png]
+  title: null           # null -> built from the run's configuration
+
+# Skip a seed whose records are already on disk. These runs segfault
+# intermittently on this machine, so the justfile re-invokes the script
+# until it completes and this is what makes that cheap.
+resume: true
+
+# Reduce and draw from the records already on disk, fitting nothing.
+plot_only: false
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

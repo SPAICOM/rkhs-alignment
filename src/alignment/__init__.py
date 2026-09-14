@@ -28,6 +28,12 @@ Methods
   2009): the same canonical stage, run on each space's reduced kernel
   matrix instead of its coordinates, with a ridge readout back into the
   receiver's latents.
+- :class:`CKAAligner` -- CKA-based matching (Maniparambil et al.,
+  2024): each agent kernelises its latents against a *shared base set*
+  of anchors, and the centred, re-scaled kernel rows of Eq. (4) are the
+  shared code; decodes with a ridge readout or with the paper's own
+  local-CKA retrieval, and exposes its matching task through
+  :meth:`CKAAligner.match`.
 - :class:`RelativeRepresentationAligner` -- anchor-based relative
   representations, decoded back into the target's raw space; with
   ``prune_threshold`` / ``n_subspaces`` it is the inverse-relative-
@@ -53,6 +59,7 @@ matching :class:`src.latent.space.LatentSpace`.
 from ..kernels import Kernel, KernelName, median_squared_distance
 from .base import Aligner, check_paired_dims
 from .cca import CCAAligner, SVCCAAligner
+from .cka import CKAAligner, cka_score, hsic
 from .kcca import KCCAAligner, rule_of_thumb_gamma
 from .linear import LinearAligner
 from .metrics import (
@@ -91,6 +98,7 @@ __all__ = [
     'PILOT_STRATEGIES',
     'Aligner',
     'CCAAligner',
+    'CKAAligner',
     'DirectMLPAligner',
     'KCCAAligner',
     'Kernel',
@@ -108,7 +116,9 @@ __all__ = [
     'ScalingMethod',
     'alignment_metrics',
     'check_paired_dims',
+    'cka_score',
     'decoder_metrics',
+    'hsic',
     'mean_reciprocal_rank',
     'median_squared_distance',
     'orthogonal_procrustes',

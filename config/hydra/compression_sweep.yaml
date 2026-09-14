@@ -18,18 +18,34 @@
 
 defaults:
   - data: semasia
-  # --- the rigid map, in two charts ------------------------------------
+  # --- the rigid map ----------------------------------------------------
   - alignment@methods.procrustes: procrustes        # truncated whitening
-  - alignment@methods.pga_procrustes: pga_procrustes  # spherical tangent
-  # --- ours, in two charts ---------------------------------------------
+  # --- ours -------------------------------------------------------------
   - alignment@methods.rkhs: rkhs                    # truncated whitening
-  - alignment@methods.pca_rkhs: pca_rkhs            # PCA, unwhitened
+  # The two chart ablations are measured and their rows are in the CSV,
+  # but they are not part of the standing comparison. Re-mount either to
+  # bring it back; `merge_summary` will slot it in beside the rest.
+  # - alignment@methods.pga_procrustes: pga_procrustes  # spherical tangent
+  # - alignment@methods.pca_rkhs: pca_rkhs              # PCA, unwhitened
   # --- canonical correlation, three variants ---------------------------
   - alignment@methods.cca: cca
   - alignment@methods.svcca: svcca
   - alignment@methods.kcca: kcca
   # --- frame-based equalization ----------------------------------------
   - alignment@methods.ppfe: ppfe
+  # --- similarity-vector matching ---------------------------------------
+  # CKA sends one kernel value per anchor, exactly as PPFE does, and the
+  # anchor count is the whole rate: nothing about the latent width enters
+  # what crosses the channel, so the method needs no truncation to be
+  # rate-matched and its kernel sees the full standardised latent.
+  # `cka_pca` is the variant that truncates with PCA first, tying the
+  # kernel's dimension to the anchor count; it is not mounted here.
+  - alignment@methods.cka: cka
+  # --- the rigid constraint, relaxed ------------------------------------
+  # Same truncated-whitened chart and the same k coefficients as
+  # `procrustes`, with the orthogonality constraint dropped: the
+  # difference between the two is the price of rigidity.
+  - alignment@methods.affine: affine
   - _self_
 
 seed: 42
@@ -84,7 +100,11 @@ pilots:
   # Re-drawn per repeat so the deterministic designs get real error bars.
   # Must exceed `n_pilots`.
   pool_size: 12000
-  n_repeats: 2
+  # Five, so the reported spread is an estimate rather than a two-point
+  # range: with two repeats the `*_std` columns are just |x1 - x2| / 2.
+  # Runtime scales with this directly -- 8 methods x 4 pairs x 7 rates x
+  # 5 repeats is 1120 fits, roughly four hours.
+  n_repeats: 5
   # Used only by a preset that declares no `pilot_strategy` of its own.
   fallback_strategy: herding
 
@@ -95,10 +115,13 @@ pilots:
 # Each ablation shares the colour of the method it ablates, which is
 # exactly what makes the pair readable as an ablation.
 hue_of:
-  pga_procrustes: procrustes    # the rigid map in a different chart
-  pca_rkhs: rkhs                # ours without the whitening half of KLT
+  affine: procrustes            # the same chart, constraint dropped
   svcca: cca                    # canonical, after an SVD truncation
   kcca: cca                     # canonical, in an RKHS
+  cka: ppfe                     # one coefficient per anchor, as PPFE
+  # Kept so a re-mounted ablation still lands on its family's colour.
+  pga_procrustes: procrustes    # the rigid map in a different chart
+  pca_rkhs: rkhs                # ours without the whitening half of KLT
 
 # --- receiver decoder -------------------------------------------------
 decoder:

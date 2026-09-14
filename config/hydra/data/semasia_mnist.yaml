@@ -30,7 +30,12 @@ cache_dir: null
 n_train: null
 n_test: null
 
-# The first entry is the default receiver when `pairs` is left null.
+# The receiver is the *widest* of these, whichever position it is listed
+# in -- the receiver's latent space is where every transported latent has
+# to land, so a narrow one caps the channel for every method at once.
+# Uncommenting a wider encoder therefore makes it the receiver, with no
+# other edit. Pin a different one with `receiver=<model>`, or give
+# explicit `pairs`.
 models:
   - vit_small_patch16_224.augreg_in1k    # d=384,  in1k
   - vit_base_patch16_224.augreg_in21k    # d=768,  in21k   (width vs small)

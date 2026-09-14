@@ -11,7 +11,11 @@ __pycache__/
 # Hydra run outputs
 outputs/
 multirun/
+
+# Study outputs: figures/ holds the PDFs and PNGs, results/ the CSVs
+# behind them. Same subdirectory layout under both.
 figures/
+results/
 idea.md
 
 # Weights & Biases run data
