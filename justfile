@@ -136,7 +136,7 @@ dimension-sweep *ARGS:
 # pair that is missing it stops and prints the commands that produce it.
 #
 #   just pair-average
-#   just pair-average 'pilot.drop=[direct_mlp:round_robin]'
+#   just pair-average 'pilot.drop=[]' interval=std
 [doc('Figures (ii) and (iii) averaged over encoder pairs')]
 pair-average *ARGS:
     uv run scripts/pair_average.py {{ARGS}}

@@ -1,4 +1,4 @@
-# REPO TITLE
+# Nonlinear Semantic Alignment via Reproducing Kernel Hilbert Spaces
 
 
 <h5 align="center">
@@ -12,7 +12,9 @@
 </h5>
 
 > [!TIP]
-> 
+> Semantic interoperability among independently trained AI-native communication devices requires aligning heterogeneous latent spaces without retraining the underlying models. Existing alignment methods typically rely on linear transformations, which may be insufficient to capture nonlinear relations between independently learned semantic representations. In this paper, we propose Residual Kernel Alignment (RKA), a novel semantic alignment method that combines a geometry-preserving Stiefel transformation with a residual in a reproducing kernel Hilbert space (RKHS) to capture nonlinear latent space mismatch. An orthogonality constraint separates the two components and, under the Stiefel isometry condition, exactly decouples their estimation. The linear component is obtained through standard Procrustes alignment, while the nonlinear residual admits a closed-form constrained kernel ridge-regression solution. The proposed alignment strategy is learned from paired latent representations, referred to as semantic pilots. We therefore also address the design of the pilot set and develop a kernel-herding selection strategy to identify informative calibration samples. Numerical results show that RKA outperforms purely linear alignment and that optimized pilot selection provides
+substantial gains in the low-pilot regime.
+
 
 ## Dependencies
 
@@ -107,8 +109,9 @@ figures/pilot_sweep/cifar10/whiten-k32/pilots_cifar10_regnety_016-to-vit_large_p
 
 **`scripts/dimension_sweep.py`**: the field against the number of
 transmitted symbols at 8192 pilots. RKA and Procrustes are read back from
-step 1; CCA, SVCCA and Proto-PFE are fitted on the same herded pilots
-(Proto-PFE on the same truncated-whitening chart). Before drawing, the
+step 1; CCA, SVCCA and Proto-PFE are fitted on the same herded pilots,
+with their rate set by the canonical rank or the anchor count rather than
+by a truncation. Before drawing, the
 run refits Procrustes and stops if it disagrees with the CSVs.
 
 ```bash
@@ -203,3 +206,4 @@ If you find this code useful for your research, please consider citing the follo
 ![NumPy](https://img.shields.io/badge/numpy-%23013243.svg?style=for-the-badge&logo=numpy&logoColor=white)
 ![Hydra](https://img.shields.io/badge/Hydra-89CFF0?style=for-the-badge&logo=hyperland&logoColor=white)
 ![w&b](https://img.shields.io/badge/Weights_&_Biases-FFBE00?style=for-the-badge&logo=WeightsAndBiases&logoColor=white)
+![Semasia](https://img.shields.io/badge/Semasia-8A2BE2?style=for-the-badge&logo=huggingface&logoColor=white)

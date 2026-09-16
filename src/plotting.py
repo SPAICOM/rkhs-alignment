@@ -18,11 +18,14 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from shutil import which
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +38,7 @@ __all__ = [
     'plot_kernel_study',
     'plot_method_comparison',
     'plot_pilot_efficiency',
+    'plot_regularization_bandwidths',
     'plot_regularization_metric',
     'plot_regularization_study',
     'use_project_style',
@@ -90,10 +94,30 @@ _STRATEGY_STYLES: tuple[tuple[str, str], ...] = (
     ('-.', 'D'),
 )
 
+# Sideways step between error-bar series, in octaves: small next to the
+# one-octave spacing of the budget and rank grids.
+_DODGE = 0.04
+
 _INK = '#0b0b0b'
 _MUTED = '#52514e'
-_SURFACE = '#fcfcfb'
+# Pure white: the figures go onto white paper, where any off-white
+# fill reads as a grey box around the plot.
+_SURFACE = '#ffffff'
 _GRID = '#e6e5e1'
+
+# A legend drawn inside a panel: one column, framed so gridlines do not
+# run through the text.
+_PANEL_LEGEND: dict[str, Any] = {
+    'ncol': 1,
+    'fontsize': 13,
+    'labelspacing': 0.3,
+    'borderpad': 0.4,
+    'labelcolor': _INK,
+    'frameon': True,
+    'facecolor': _SURFACE,
+    'edgecolor': _GRID,
+    'framealpha': 0.9,
+}
 # Neutral fill for the method-comparison bars. Identity there is carried
 # by the axis label of each row, so the only thing colour has to say is
 # "this one is ours"; a second hue would imply a grouping that is not in
@@ -161,6 +185,11 @@ def plot_pilot_efficiency(
     title: str | None = None,
     shade_below: tuple[float, str] | None = None,
     formats: tuple[str, ...] = ('png', 'pdf'),
+    spread: str | None = 'std',
+    errorbars: bool = False,
+    legend: tuple[str, str] | None = None,
+    panel: tuple[float, float] = (9.0, 7.0),
+    text_scale: float = 1.0,
 ) -> list[Path]:
     """Plot each metric against the pilot budget.
 
@@ -168,7 +197,7 @@ def plot_pilot_efficiency(
     ----------
     summary : list[dict]
         One row per ``(method, strategy, n_pilots)``, carrying
-        ``f'{metric}_mean'`` and ``f'{metric}_std'`` for every metric.
+        ``f'{metric}_mean'`` and ``f'{metric}_{spread}'`` for every metric.
     metrics : list[str]
         Metrics to panel, in order.
     out_path : str | Path
@@ -184,6 +213,21 @@ def plot_pilot_efficiency(
         the orthogonality constraint admits only the zero residual.
     formats : tuple[str, ...], default=('png', 'pdf')
         Extensions to write.
+    spread : str | None, default='std'
+        Suffix of the column holding the half-width drawn around each
+        mean, e.g. ``'ci95'``; ``None`` draws the means alone.
+    errorbars : bool, default=False
+        Draw the spread as capped error bars instead of a shaded band.
+    legend : tuple[str, str], optional
+        ``(metric, loc)``: a one-column legend inside that metric's panel
+        at matplotlib location ``loc``. By default one shared legend sits
+        below the panels.
+    panel : tuple[float, float], default=(9.0, 7.0)
+        Width and height of one panel, in inches.
+    text_scale : float, default=1.0
+        Multiplier on every font size. With smaller ``panel``, it keeps
+        text the size a single-panel figure prints it at when both are
+        set at the same width.
 
     Returns
     -------
@@ -195,9 +239,13 @@ def plot_pilot_efficiency(
     colors = _assign_colors(methods)
     styles = dict(zip(strategies, _STRATEGY_STYLES))
     budgets = sorted({r['n_pilots'] for r in summary})
+    series = list(dict.fromkeys((r['method'], r['strategy']) for r in summary))
 
     fig, axes = plt.subplots(
-        1, len(metrics), figsize=(9.0 * len(metrics), 7.0), squeeze=False
+        1,
+        len(metrics),
+        figsize=(panel[0] * len(metrics), panel[1]),
+        squeeze=False,
     )
     fig.patch.set_facecolor(_SURFACE)
 
@@ -219,7 +267,7 @@ def plot_pilot_efficiency(
                 xycoords=('data', 'axes fraction'),
                 ha='center',
                 color=_MUTED,
-                fontsize=12,
+                fontsize=12 * text_scale,
             )
         for method in methods:
             for strategy in strategies:
@@ -235,7 +283,11 @@ def plot_pilot_efficiency(
                     continue
                 x = np.array([r['n_pilots'] for r in rows], dtype=float)
                 mu = np.array([r[f'{metric}_mean'] for r in rows])
-                sd = np.array([r.get(f'{metric}_std', 0.0) for r in rows])
+                sd = (
+                    np.array([r.get(f'{metric}_{spread}', 0.0) for r in rows])
+                    if spread is not None
+                    else None
+                )
                 line, marker = styles[strategy]
                 label = (
                     f'{_label(method)} - {_label(strategy)}'
@@ -249,25 +301,21 @@ def plot_pilot_efficiency(
                 # and it is hue and dash, not weight, that carry identity
                 # here. Coincidence is now left to the markers, which
                 # sit at different points along the line.
-                ax.plot(
+                _draw_series(
+                    ax,
                     x,
                     mu,
-                    line,
+                    sd,
+                    line=line,
                     marker=marker,
                     color=colors[method],
                     label=label,
-                    linewidth=2.0,
-                    markersize=8,
-                    markeredgecolor=_SURFACE,
-                    markeredgewidth=1.2,
-                )
-                ax.fill_between(
-                    x,
-                    mu - sd,
-                    mu + sd,
-                    color=colors[method],
-                    alpha=0.12,
-                    linewidth=0,
+                    errorbars=errorbars,
+                    dodge=_DODGE
+                    * (
+                        series.index((method, strategy))
+                        - (len(series) - 1) / 2
+                    ),
                 )
 
         if reference and metric in reference:
@@ -285,7 +333,7 @@ def plot_pilot_efficiency(
                 textcoords='offset points',
                 ha='left',
                 color=_MUTED,
-                fontsize=13,
+                fontsize=13 * text_scale,
             )
 
         # Budgets are geometric, so a linear axis crushes the small ones
@@ -294,35 +342,56 @@ def plot_pilot_efficiency(
         ax.set_xticks(budgets)
         ax.set_xticklabels([str(b) for b in budgets])
         ax.minorticks_off()
-        ax.set_xlabel('Number of semantic pilots $N$', color=_INK)
+        ax.set_xlabel(r'Number of semantic pilots $N$', color=_INK)
         ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
         ax.grid(True, color='#e6e5e1', linewidth=0.8)
         ax.set_axisbelow(True)
-        for side in ('top', 'right'):
-            ax.spines[side].set_visible(False)
-        for side in ('left', 'bottom'):
-            ax.spines[side].set_color('#d8d7d2')
-        ax.tick_params(colors=_MUTED, labelsize=14)
-        ax.xaxis.label.set_fontsize(16)
-        ax.yaxis.label.set_fontsize(16)
+        for spine in ax.spines.values():
+            spine.set_color(_INK)
+        ax.tick_params(colors=_INK, labelsize=14 * text_scale)
+        ax.xaxis.label.set_fontsize(16 * text_scale)
+        ax.yaxis.label.set_fontsize(16 * text_scale)
 
-    # One shared legend below the panels: with methods x strategies the
-    # entry count grows fast, and an in-panel box lands on the curves.
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        frameon=False,
-        fontsize=13,
-        labelcolor=_INK,
-        loc='lower center',
-        bbox_to_anchor=(0.5, 0.0),
-        ncol=min(len(labels), 4),
+    # One shared legend below the panels unless a panel is named: with
+    # methods x strategies the entry count grows fast, and an in-panel box
+    # can land on the curves.
+    # Inside a panel there is no room for one entry per method x strategy,
+    # so the two channels get their own entries: a coloured line per
+    # method, and a neutral dash + marker per strategy.
+    entries = None
+    if legend is not None and len(strategies) > 1:
+        entries = (
+            [
+                mpl.lines.Line2D([], [], color=colors[m], linewidth=2.0)
+                for m in methods
+            ]
+            + [
+                mpl.lines.Line2D(
+                    [],
+                    [],
+                    linestyle=styles[s][0],
+                    marker=styles[s][1],
+                    color=_MUTED,
+                    linewidth=2.0,
+                    markersize=8,
+                    markeredgecolor=_SURFACE,
+                    markeredgewidth=1.2,
+                )
+                for s in strategies
+            ],
+            [_label(m) for m in methods] + [_label(s) for s in strategies],
+        )
+    bottom = _place_legend(
+        fig,
+        axes[0],
+        metrics,
+        legend,
+        fontsize=13 * text_scale,
+        entries=entries,
     )
-    rows = int(np.ceil(len(labels) / min(len(labels), 4)))
     if title:
-        fig.suptitle(title, color=_INK, fontsize=18)
-    fig.tight_layout(rect=(0, 0.035 * rows + 0.02, 1, 1))
+        fig.suptitle(title, color=_INK, fontsize=18 * text_scale)
+    _settle(fig, axes[0], metrics, legend, bottom)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -343,6 +412,11 @@ def plot_dimension_sweep(
     hue_of: dict[str, str] | None = None,
     title: str | None = None,
     formats: tuple[str, ...] = ('png', 'pdf'),
+    spread: str | None = 'std',
+    errorbars: bool = False,
+    legend: tuple[str, str] | None = None,
+    panel: tuple[float, float] = (9.0, 7.0),
+    text_scale: float = 1.0,
 ) -> list[Path]:
     """Plot each metric against the compression dimension, at one budget.
 
@@ -361,8 +435,8 @@ def plot_dimension_sweep(
         One row per ``(method, symbols)``, carrying every metric. The x
         position is ``symbols``, the rate the method actually delivered.
         A row carries either ``metric`` itself or ``f'{metric}_mean'``
-        with an optional ``f'{metric}_std'``, drawn as a +/- 1 sd band --
-        the form an average over encoder pairs comes in.
+        with an optional ``f'{metric}_{spread}'`` half-width drawn around
+        it -- the form an average over encoder pairs comes in.
     metrics : list[str]
         Metrics to panel, in order.
     out_path : str | Path
@@ -375,6 +449,19 @@ def plot_dimension_sweep(
         Figure title.
     formats : tuple[str, ...], default=('png', 'pdf')
         Extensions to write.
+    spread : str | None, default='std'
+        Suffix of the half-width column, e.g. ``'ci95'``; ``None`` draws
+        the means alone.
+    errorbars : bool, default=False
+        Draw the spread as capped error bars instead of a shaded band.
+    legend : tuple[str, str], optional
+        ``(metric, loc)``: a one-column legend inside that metric's panel.
+        By default one shared legend sits below the panels.
+    panel : tuple[float, float], default=(9.0, 7.0)
+        Width and height of one panel, in inches.
+    text_scale : float, default=1.0
+        Multiplier on every font size, as in
+        :func:`plot_pilot_efficiency`.
 
     Returns
     -------
@@ -396,7 +483,10 @@ def plot_dimension_sweep(
     rates = sorted({int(r['symbols']) for r in summary})
 
     fig, axes = plt.subplots(
-        1, len(metrics), figsize=(9.0 * len(metrics), 7.0), squeeze=False
+        1,
+        len(metrics),
+        figsize=(panel[0] * len(metrics), panel[1]),
+        squeeze=False,
     )
     fig.patch.set_facecolor(_SURFACE)
 
@@ -418,29 +508,26 @@ def plot_dimension_sweep(
             line, marker = styles[method]
             x = np.array([r['symbols'] for r in rows], dtype=float)
             mu = np.array([r[key] for r in rows], dtype=float)
-            if averaged:
-                sd = np.array(
-                    [r.get(f'{metric}_std') or 0.0 for r in rows], dtype=float
+            sd = (
+                np.array(
+                    [r.get(f'{metric}_{spread}') or 0.0 for r in rows],
+                    dtype=float,
                 )
-                ax.fill_between(
-                    x,
-                    mu - sd,
-                    mu + sd,
-                    color=colors[hue_of.get(method, method)],
-                    alpha=0.12,
-                    linewidth=0,
-                )
-            ax.plot(
+                if averaged and spread is not None
+                else None
+            )
+            _draw_series(
+                ax,
                 x,
                 mu,
-                line,
+                sd,
+                line=line,
                 marker=marker,
                 color=colors[hue_of.get(method, method)],
                 label=_label(method),
-                linewidth=2.0,
-                markersize=8,
-                markeredgecolor=_SURFACE,
-                markeredgewidth=1.2,
+                errorbars=errorbars,
+                dodge=_DODGE
+                * (methods.index(method) - (len(methods) - 1) / 2),
             )
 
         if reference and metric in reference:
@@ -458,7 +545,7 @@ def plot_dimension_sweep(
                 textcoords='offset points',
                 ha='left',
                 color=_MUTED,
-                fontsize=13,
+                fontsize=13 * text_scale,
             )
 
         # Ranks are geometric; a linear axis crushes the small ones.
@@ -470,33 +557,22 @@ def plot_dimension_sweep(
         ax.set_xticks(ticks)
         ax.set_xticklabels([str(t) for t in ticks])
         ax.minorticks_off()
-        ax.set_xlabel('Transmitted symbols $k$', color=_INK)
+        ax.set_xlabel(r'Transmitted symbols $k$', color=_INK)
         ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
         ax.grid(True, color=_GRID, linewidth=0.8)
         ax.set_axisbelow(True)
-        for side in ('top', 'right'):
-            ax.spines[side].set_visible(False)
-        for side in ('left', 'bottom'):
-            ax.spines[side].set_color('#d8d7d2')
-        ax.tick_params(colors=_MUTED, labelsize=14)
-        ax.xaxis.label.set_fontsize(16)
-        ax.yaxis.label.set_fontsize(16)
+        for spine in ax.spines.values():
+            spine.set_color(_INK)
+        ax.tick_params(colors=_INK, labelsize=14 * text_scale)
+        ax.xaxis.label.set_fontsize(16 * text_scale)
+        ax.yaxis.label.set_fontsize(16 * text_scale)
 
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        frameon=False,
-        fontsize=13,
-        labelcolor=_INK,
-        loc='lower center',
-        bbox_to_anchor=(0.5, 0.0),
-        ncol=min(len(labels), 4),
+    bottom = _place_legend(
+        fig, axes[0], metrics, legend, fontsize=13 * text_scale
     )
-    legend_rows = int(np.ceil(len(labels) / min(len(labels), 4)))
     if title:
-        fig.suptitle(title, color=_INK, fontsize=18)
-    fig.tight_layout(rect=(0, 0.035 * legend_rows + 0.02, 1, 1))
+        fig.suptitle(title, color=_INK, fontsize=18 * text_scale)
+    _settle(fig, axes[0], metrics, legend, bottom)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,6 +583,103 @@ def plot_dimension_sweep(
         written.append(path)
     plt.close(fig)
     return written
+
+
+def _draw_series(
+    ax: plt.Axes,
+    x: np.ndarray,
+    mu: np.ndarray,
+    spread: np.ndarray | None,
+    *,
+    line: str,
+    marker: str,
+    color: str,
+    label: str,
+    errorbars: bool,
+    dodge: float = 0.0,
+) -> None:
+    """One curve, with ``mu +/- spread`` as a band or as capped error bars.
+
+    ``spread=None`` draws the mean alone. ``dodge`` shifts error-bar
+    series sideways by that many octaves, so bars that share an x position
+    stay attributable to their curve. Every axis these are drawn on is
+    logarithmic, hence the multiplicative shift.
+    """
+    style = {
+        'marker': marker,
+        'color': color,
+        'label': label,
+        'linewidth': 2.0,
+        'markersize': 8,
+        'markeredgecolor': _SURFACE,
+        'markeredgewidth': 1.2,
+    }
+    if spread is not None and errorbars:
+        x = x * 2.0**dodge
+        # Bars unlabelled and drawn apart from the line, so the legend
+        # shows the line and marker only.
+        ax.errorbar(
+            x,
+            mu,
+            yerr=spread,
+            fmt='none',
+            ecolor=color,
+            elinewidth=1.4,
+            capsize=5,
+            capthick=1.4,
+        )
+        ax.plot(x, mu, line, **style)
+        return
+    if spread is not None:
+        ax.fill_between(
+            x, mu - spread, mu + spread, color=color, alpha=0.12, linewidth=0
+        )
+    ax.plot(x, mu, line, **style)
+
+
+def _place_legend(
+    fig: plt.Figure,
+    axes: np.ndarray,
+    metrics: list[str],
+    legend: tuple[str, str] | None,
+    fontsize: float = 13.0,
+    entries: tuple[list[Any], list[str]] | None = None,
+) -> float:
+    """Draw the legend; return the bottom margin ``tight_layout`` must keep.
+
+    ``legend`` is ``(metric, loc)`` for a one-column legend inside that
+    metric's panel, or ``None`` for one shared legend below all of them.
+    ``entries`` replaces the ``(handles, labels)`` read off the first
+    panel.
+    """
+    handles, labels = entries or axes[0].get_legend_handles_labels()
+    if legend is not None:
+        panel, loc = legend
+        if panel not in metrics:
+            raise ValueError(
+                f'Legend panel {panel!r} is not one of the metrics {metrics}.'
+            )
+        axes[metrics.index(panel)].legend(
+            handles,
+            labels,
+            loc=loc,
+            **(_PANEL_LEGEND | {'fontsize': fontsize}),
+        )
+        return 0.0
+    ncol = min(len(labels), 4)
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        fontsize=fontsize,
+        labelcolor=_INK,
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.0),
+        ncol=ncol,
+    )
+    # About a quarter of an inch per 13 pt row, as a fraction of the height.
+    row = 0.245 * fontsize / 13.0 / fig.get_figheight()
+    return row * int(np.ceil(len(labels) / ncol)) + 0.02
 
 
 def _assign_colors(methods: list[str]) -> dict[str, str]:
@@ -541,7 +714,7 @@ def _ordered(rows: list[dict[str, Any]], key: str) -> list[str]:
 def _label(name: str) -> str:
     """Human-readable series label."""
     return {
-        'rkhs': 'RKA (ours)',
+        'rkhs': 'RKA',
         'procrustes': 'Procrustes',
         'direct_mlp': 'Direct MLP',
         'residual_mlp': 'Residual MLP',
@@ -561,7 +734,7 @@ def _label(name: str) -> str:
         'herding': 'kernel herding',
         'random': 'random',
         'stratified': 'stratified',
-        'round_robin': 'round-robin',
+        'round_robin': 'random stratified',
         'fps': 'farthest-point',
         'kmeans': 'k-means medoids',
         'rbf': 'RBF',
@@ -691,11 +864,9 @@ def plot_regularization_study(
         ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
         ax.grid(True, color='#e6e5e1', linewidth=0.8)
         ax.set_axisbelow(True)
-        for side in ('top', 'right'):
-            ax.spines[side].set_visible(False)
-        for side in ('left', 'bottom'):
-            ax.spines[side].set_color('#d8d7d2')
-        ax.tick_params(colors=_MUTED, labelsize=14)
+        for spine in ax.spines.values():
+            spine.set_color(_INK)
+        ax.tick_params(colors=_INK, labelsize=14)
         ax.xaxis.label.set_fontsize(16)
         ax.yaxis.label.set_fontsize(16)
 
@@ -735,6 +906,9 @@ def plot_regularization_metric(
     method: str = 'pca_rkhs',
     labels: dict[str, str] | None = None,
     formats: tuple[str, ...] = ('png', 'pdf'),
+    panel: tuple[float, float] = (9.0, 7.0),
+    text_scale: float = 1.0,
+    annotate: bool = True,
 ) -> list[Path]:
     """One metric against the RKHS regularisation, on its own figure.
 
@@ -766,6 +940,15 @@ def plot_regularization_metric(
         moving its hue.
     formats : tuple[str, ...], default=('png', 'pdf')
         Extensions to write.
+    panel : tuple[float, float], default=(9.0, 7.0)
+        Width and height of the figure, in inches.
+    text_scale : float, default=1.0
+        Multiplier on every font size, as in
+        :func:`plot_pilot_efficiency`.
+    annotate : bool, default=True
+        Write the in-plot notes: ``best lambda = ...`` beside the rule at
+        the best ``lam``, and ``native RX`` on the reference rule. Without
+        them the rules stay and a caption has to say what they mark.
 
     Returns
     -------
@@ -779,7 +962,7 @@ def plot_regularization_metric(
     colors = _assign_colors([method, *baselines])
     legend = lambda name: labels.get(name, _label(name))  # noqa: E731
 
-    fig, ax = plt.subplots(figsize=(9.0, 7.0))
+    fig, ax = plt.subplots(figsize=panel)
     fig.patch.set_facecolor(_SURFACE)
     ax.set_facecolor(_SURFACE)
 
@@ -818,65 +1001,432 @@ def plot_regularization_metric(
             color=_MUTED,
             linewidth=1.6,
         )
-        ax.annotate(
-            'native RX',
-            xy=(0.0, reference[metric]),
-            xycoords=('axes fraction', 'data'),
-            xytext=(4, 5),
-            textcoords='offset points',
-            ha='left',
-            color=_MUTED,
-            fontsize=13,
-        )
-
-    best = rows[int(np.argmax(mu))]
-    ax.axvline(best['lam'], color=_MUTED, linewidth=1.0, alpha=0.5)
-    ax.annotate(
-        rf'best $\lambda$ = {best["lam"]:.3g}',
-        xy=(best['lam'], mu.max()),
-        xytext=(6, -14),
-        textcoords='offset points',
-        color=_MUTED,
-        fontsize=13,
-    )
+        if annotate:
+            ax.annotate(
+                'native RX',
+                xy=(0.0, reference[metric]),
+                xycoords=('axes fraction', 'data'),
+                xytext=(4, 5),
+                textcoords='offset points',
+                ha='left',
+                color=_MUTED,
+                fontsize=13 * text_scale,
+            )
 
     ax.set_xscale('log')
     ax.set_xlabel(r'RKHS regularisation $\lambda$', color=_INK)
     ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
     ax.grid(True, color=_GRID, linewidth=0.8)
     ax.set_axisbelow(True)
-    for side in ('top', 'right'):
-        ax.spines[side].set_visible(False)
-    for side in ('left', 'bottom'):
-        ax.spines[side].set_color('#d8d7d2')
-    ax.tick_params(colors=_MUTED, labelsize=14)
-    ax.xaxis.label.set_fontsize(16)
-    ax.yaxis.label.set_fontsize(16)
+    for spine in ax.spines.values():
+        spine.set_color(_INK)
+    ax.tick_params(colors=_INK, labelsize=14 * text_scale)
+    ax.xaxis.label.set_fontsize(16 * text_scale)
+    ax.yaxis.label.set_fontsize(16 * text_scale)
 
-    handles, labels = ax.get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        frameon=False,
-        fontsize=13,
-        labelcolor=_INK,
-        loc='lower center',
-        bbox_to_anchor=(0.5, 0.0),
-        ncol=min(len(labels), 4),
-    )
+    best = rows[int(np.argmax(mu))]
+    rule = ax.axvline(best['lam'], color=_MUTED, linewidth=1.0, alpha=0.5)
     if title:
-        fig.suptitle(title, color=_INK, fontsize=18)
-    fig.tight_layout(rect=(0, 0.09, 1, 1))
+        fig.suptitle(title, color=_INK, fontsize=18 * text_scale)
+    fig.tight_layout()
+    # The label goes in once the axes have their final size, since where
+    # it fits depends on it; the legend follows and steers around the
+    # label as well as the lines.
+    if annotate:
+        _label_rule(
+            ax,
+            rf'best $\lambda = {_sci(best["lam"])}$',
+            best['lam'],
+            avoid=[line for line in ax.get_lines() if line is not rule],
+            fontsize=13 * text_scale,
+        )
+    _legend_clear(ax, fontsize=13 * text_scale)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = []
     for ext in formats:
         path = _with_extension(out_path, ext)
-        fig.savefig(path, dpi=200, facecolor=_SURFACE, bbox_inches='tight')
+        fig.savefig(
+            path,
+            dpi=200,
+            facecolor=_SURFACE,
+            bbox_inches='tight',
+            pad_inches=0.02,
+        )
         written.append(path)
     plt.close(fig)
     return written
+
+
+def _bandwidth_ramp(n: int) -> list[str]:
+    """``n`` ordered steps of RKA's hue, light to dark.
+
+    The bandwidth is an *ordered* quantity, so it gets a sequential ramp
+    rather than ``n`` categorical hues: the reader has to see which curve
+    sits between which, and `_assign_colors` would refuse nine series
+    anyway -- the validated palette holds four. Staying inside RKA's hue
+    keeps the figure's identity, and varying only lightness is what makes
+    the order survive greyscale and every CVD simulation at once.
+    """
+    base = np.array(mpl.colors.to_rgb(METHOD_COLORS['rkhs']))
+    light = base + (1.0 - base) * 0.62
+    dark = base * 0.38
+    if n < 2:
+        return [mpl.colors.to_hex(base)]
+    steps = np.linspace(0.0, 1.0, n)
+    return [mpl.colors.to_hex(light + (dark - light) * t) for t in steps]
+
+
+def plot_regularization_bandwidths(
+    curves: list[dict[str, Any]],
+    metric: str,
+    out_path: str | Path,
+    baselines: dict[str, dict[str, float]] | None = None,
+    reference: dict[str, float] | None = None,
+    title: str | None = None,
+    labels: dict[str, str] | None = None,
+    formats: tuple[str, ...] = ('png', 'pdf'),
+    panel: tuple[float, float] = (9.0, 7.0),
+    text_scale: float = 1.0,
+    annotate: bool = True,
+) -> list[Path]:
+    r"""One metric against ``lambda``, one curve per kernel bandwidth.
+
+    The same axes as :func:`plot_regularization_metric` -- the swept
+    method over ``lam``, the flat baselines it is read against -- with the
+    bandwidth on the colour channel, so the two knobs of the residual
+    stage can be read as the surface they are. What the figure is for is
+    the interaction between them: the Gram eigenvalues carry the kernel's
+    scale, so a bandwidth that moves the spectrum drags the useful
+    ``lambda`` window with it, and a sweep of one at a fixed value of the
+    other cannot show that.
+
+    No ``+/- sd`` band is drawn. Nine translucent bands over one axis
+    read as a single smear and hide the curves they belong to; the spread
+    is in the CSV, and a single bandwidth is the figure the other plotter
+    draws.
+
+    Parameters
+    ----------
+    curves : list[dict]
+        One row per ``(bandwidth_scale, lam)``, with those two keys and
+        ``f'{metric}_mean'``.
+    metric : str
+        The metric to plot.
+    out_path : str | Path
+        Destination stem; one file per entry of ``formats``.
+    baselines : dict[str, dict[str, float]], optional
+        ``{method: {metric: value}}``, drawn as horizontal lines. They do
+        not depend on the bandwidth either: the rigid stage is fitted
+        before the kernel is ever consulted.
+    reference : dict[str, float], optional
+        Receiver's native performance, drawn as a dotted rule.
+    title : str, optional
+        Figure title.
+    labels : dict[str, str], optional
+        Legend text per baseline name, overriding the default label.
+    formats : tuple[str, ...], default=('png', 'pdf')
+        Extensions to write.
+    panel : tuple[float, float], default=(9.0, 7.0)
+        Width and height of the figure, in inches.
+    text_scale : float, default=1.0
+        Multiplier on every font size.
+    annotate : bool, default=True
+        Write the in-plot notes: the rule at the best ``(bandwidth,
+        lambda)``, and ``native RX`` on the reference rule.
+
+    Returns
+    -------
+    list[Path]
+        The files written.
+    """
+    baselines = baselines or {}
+    labels = labels or {}
+    legend = lambda name: labels.get(name, _label(name))  # noqa: E731
+    scales = sorted({float(r['bandwidth_scale']) for r in curves})
+    colors = dict(zip(scales, _bandwidth_ramp(len(scales))))
+    line_colors = _assign_colors(list(baselines))
+
+    fig, ax = plt.subplots(figsize=panel)
+    fig.patch.set_facecolor(_SURFACE)
+    ax.set_facecolor(_SURFACE)
+
+    best = max(curves, key=lambda r: r[f'{metric}_mean'])
+    for scale in scales:
+        rows = sorted(
+            (r for r in curves if float(r['bandwidth_scale']) == scale),
+            key=lambda r: r['lam'],
+        )
+        ax.plot(
+            [r['lam'] for r in rows],
+            [r[f'{metric}_mean'] for r in rows],
+            '-',
+            marker='o',
+            color=colors[scale],
+            label=f'{scale:g}',
+            linewidth=2.0,
+            markersize=6,
+            markeredgecolor=_SURFACE,
+            markeredgewidth=1.0,
+        )
+
+    for name, values in baselines.items():
+        if metric in values:
+            ax.axhline(
+                values[metric],
+                linestyle='--',
+                color=line_colors[name],
+                linewidth=2.0,
+                label=legend(name),
+            )
+
+    if reference and metric in reference:
+        ax.axhline(
+            reference[metric],
+            linestyle=(0, (1, 3)),
+            color=_MUTED,
+            linewidth=1.6,
+        )
+        if annotate:
+            ax.annotate(
+                'native RX',
+                xy=(0.0, reference[metric]),
+                xycoords=('axes fraction', 'data'),
+                xytext=(4, 5),
+                textcoords='offset points',
+                ha='left',
+                color=_MUTED,
+                fontsize=13 * text_scale,
+            )
+
+    ax.set_xscale('log')
+    ax.set_xlabel(r'RKHS regularisation $\lambda$', color=_INK)
+    ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
+    ax.grid(True, color=_GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color(_INK)
+    ax.tick_params(colors=_INK, labelsize=14 * text_scale)
+    ax.xaxis.label.set_fontsize(16 * text_scale)
+    ax.yaxis.label.set_fontsize(16 * text_scale)
+
+    rule = ax.axvline(best['lam'], color=_MUTED, linewidth=1.0, alpha=0.5)
+    if title:
+        fig.suptitle(title, color=_INK, fontsize=18 * text_scale)
+
+    # Outside the axes, and in the ramp's own order. A ten-entry legend is
+    # taller than any clear space an in-panel placement could find, and
+    # covering the curves to name them defeats the figure.
+    handles, names = ax.get_legend_handles_labels()
+    key = ax.legend(
+        handles,
+        names,
+        loc='center left',
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False,
+        fontsize=13 * text_scale,
+        labelcolor=_INK,
+        title='Bandwidth scale',
+    )
+    key.get_title().set_color(_INK)
+    key.get_title().set_fontsize(13 * text_scale)
+    fig.tight_layout()
+    if annotate:
+        _label_rule(
+            ax,
+            rf'best: $\lambda = {_sci(best["lam"])}$, '
+            rf'scale $= {best["bandwidth_scale"]:g}$',
+            best['lam'],
+            avoid=[line for line in ax.get_lines() if line is not rule],
+            fontsize=13 * text_scale,
+        )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    for ext in formats:
+        path = _with_extension(out_path, ext)
+        fig.savefig(
+            path,
+            dpi=200,
+            facecolor=_SURFACE,
+            bbox_inches='tight',
+            pad_inches=0.02,
+        )
+        written.append(path)
+    plt.close(fig)
+    return written
+
+
+def _sci(value: float) -> str:
+    r"""``value`` as mathtext: ``3.16\times10^{-5}``, ``10^{-8}``, ``0.5``."""
+    if value == 0 or 1e-2 <= abs(value) < 1e3:
+        return f'{value:.3g}'
+    exponent = int(np.floor(np.log10(abs(value))))
+    mantissa = f'{value / 10.0**exponent:.3g}'
+    if mantissa == '10':  # rounding carried into the next decade
+        mantissa, exponent = '1', exponent + 1
+    power = f'10^{{{exponent}}}'
+    return power if mantissa == '1' else rf'{mantissa}\times{power}'
+
+
+def _clearance(
+    ax: plt.Axes, avoid: list[mpl.lines.Line2D]
+) -> Callable[[mpl.transforms.Bbox], bool]:
+    """A test for whether a display-space box sits clear on ``ax``.
+
+    Clear means inside the axes, meeting none of the ``avoid`` lines
+    (their markers included, padded by half a marker) nor any error bar,
+    and overlapping no text already on the axes when the test is built.
+    The positions are frozen then too: rebuild it after changing limits.
+    """
+    fig = ax.figure
+    renderer = fig.canvas.get_renderer()
+    inside = ax.get_window_extent(renderer)
+    pad = 6 * fig.dpi / 72  # half a marker, in pixels
+    paths = [
+        line.get_transform().transform_path(line.get_path()) for line in avoid
+    ] + [
+        mpl.path.Path(bars.get_transform().transform(segment))
+        for bars in ax.collections
+        if isinstance(bars, mpl.collections.LineCollection)
+        for segment in bars.get_segments()
+    ]
+    points = [
+        line.get_transform().transform(line.get_xydata())
+        for line in avoid
+        if line.get_marker() not in (None, 'None', '', ' ')
+    ]
+    taken = [t.get_window_extent(renderer) for t in ax.texts]
+
+    def clear(box: mpl.transforms.Bbox) -> bool:
+        hit = box.padded(pad)
+        return (
+            inside.x0 <= box.x0
+            and box.x1 <= inside.x1
+            and inside.y0 <= box.y0
+            and box.y1 <= inside.y1
+            and not any(p.intersects_bbox(hit, filled=False) for p in paths)
+            and not any(
+                np.any(
+                    (xy[:, 0] >= hit.x0)
+                    & (xy[:, 0] <= hit.x1)
+                    & (xy[:, 1] >= hit.y0)
+                    & (xy[:, 1] <= hit.y1)
+                )
+                for xy in points
+            )
+            and not any(box.overlaps(t) for t in taken)
+        )
+
+    return clear
+
+
+def _settle(
+    fig: plt.Figure,
+    axes: np.ndarray,
+    metrics: list[str],
+    legend: tuple[str, str] | None,
+    bottom: float,
+) -> None:
+    """Lay the figure out, stretching one axis to clear an in-panel legend.
+
+    A legend pinned to a corner of a panel can land on the curves once the
+    text is set at print size. The y-axis of that panel is then extended
+    away from the corner -- down for a ``lower`` legend, up for an
+    ``upper`` one -- a few percent at a time until nothing drawn runs under
+    the box. Layout moves the axes, so the check runs again after it.
+    """
+    fig.tight_layout(rect=(0, bottom, 1, 1))
+    if legend is None:
+        return
+    panel, loc = legend
+    ax = axes[metrics.index(panel)]
+    box = ax.get_legend()
+    renderer = fig.canvas.get_renderer()
+    for _ in range(2):
+        for _ in range(60):
+            clear = _clearance(ax, ax.get_lines())
+            if clear(box.get_window_extent(renderer)):
+                break
+            low, high = ax.get_ylim()
+            step = 0.03 * (high - low)
+            if 'lower' in loc:
+                ax.set_ylim(low - step, high)
+            elif 'upper' in loc:
+                ax.set_ylim(low, high + step)
+            else:
+                return
+        fig.tight_layout(rect=(0, bottom, 1, 1))
+
+
+def _legend_clear(ax: plt.Axes, fontsize: float = 13.0) -> None:
+    """A one-column legend in a corner, slid inward until it covers nothing.
+
+    Matplotlib's ``loc='best'`` only knows nine fixed spots, so when a
+    reference rule runs along the top and the curves along the bottom
+    every corner is taken and it settles for the middle of the right
+    edge. Here each corner may instead slide toward the centre, and the
+    spot needing the smallest slide wins, ties broken upper right, upper
+    left, lower right, lower left. That puts the legend just under a
+    ceiling rule, or just over a floor line, rather than adrift. Every
+    line on the axes and every text already there counts as covered;
+    with no clear spot within half the axes, ``'best'`` decides.
+    """
+    clear = _clearance(ax, ax.get_lines())
+    renderer = ax.figure.canvas.get_renderer()
+    style = _PANEL_LEGEND | {'fontsize': fontsize}
+    corners = (
+        ('upper right', 1.0, True),
+        ('upper left', 0.0, True),
+        ('lower right', 1.0, False),
+        ('lower left', 0.0, False),
+    )
+    for slide in np.arange(0.0, 0.5, 0.01):
+        for loc, x, top in corners:
+            legend = ax.legend(
+                loc=loc,
+                bbox_to_anchor=(x, 1.0 - slide if top else slide),
+                bbox_transform=ax.transAxes,
+                **style,
+            )
+            if clear(legend.get_window_extent(renderer)):
+                return
+    ax.legend(loc='best', **style)
+
+
+def _label_rule(
+    ax: plt.Axes,
+    text: str,
+    x: float,
+    avoid: list[mpl.lines.Line2D],
+    fontsize: float = 13.0,
+) -> None:
+    """Label a vertical rule at data ``x`` where the label crosses nothing.
+
+    Beside the rule, right then left, from the top of the axes down, the
+    first spot that :func:`_clearance` passes wins. If every spot is
+    taken, the label goes top right.
+    """
+    renderer = ax.figure.canvas.get_renderer()
+    clear = _clearance(ax, avoid)
+    style = {
+        'xycoords': ('data', 'axes fraction'),
+        'textcoords': 'offset points',
+        'va': 'center',
+        'color': _MUTED,
+        'fontsize': fontsize,
+    }
+    for y in (0.92, 0.8, 0.68, 0.56, 0.44, 0.32, 0.2, 0.08):
+        for dx, ha in ((6, 'left'), (-6, 'right')):
+            label = ax.annotate(
+                text, xy=(x, y), xytext=(dx, 0), ha=ha, **style
+            )
+            if clear(label.get_window_extent(renderer)):
+                return
+            label.remove()
+    ax.annotate(text, xy=(x, 0.92), xytext=(6, 0), ha='left', **style)
 
 
 def plot_budget_selection(
@@ -961,11 +1511,9 @@ def plot_budget_selection(
     ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
     ax.grid(True, color=_GRID, linewidth=0.8)
     ax.set_axisbelow(True)
-    for side in ('top', 'right'):
-        ax.spines[side].set_visible(False)
-    for side in ('left', 'bottom'):
-        ax.spines[side].set_color('#d8d7d2')
-    ax.tick_params(colors=_MUTED, labelsize=14)
+    for spine in ax.spines.values():
+        spine.set_color(_INK)
+    ax.tick_params(colors=_INK, labelsize=14)
     ax.xaxis.label.set_fontsize(16)
     ax.yaxis.label.set_fontsize(16)
 
@@ -1134,8 +1682,8 @@ def plot_method_comparison(
         ax.set_axisbelow(True)
         for side in ('top', 'right', 'left'):
             ax.spines[side].set_visible(False)
-        ax.spines['bottom'].set_color('#d8d7d2')
-        ax.tick_params(colors=_MUTED, labelsize=13)
+        ax.spines['bottom'].set_color(_INK)
+        ax.tick_params(colors=_INK, labelsize=13)
         ax.xaxis.label.set_fontsize(16)
 
     axes[0][0].set_yticks(y)
@@ -1259,11 +1807,9 @@ def plot_kernel_study(
         ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
         ax.grid(True, color=_GRID, linewidth=0.8)
         ax.set_axisbelow(True)
-        for side in ('top', 'right'):
-            ax.spines[side].set_visible(False)
-        for side in ('left', 'bottom'):
-            ax.spines[side].set_color('#d8d7d2')
-        ax.tick_params(colors=_MUTED, labelsize=14)
+        for spine in ax.spines.values():
+            spine.set_color(_INK)
+        ax.tick_params(colors=_INK, labelsize=14)
         ax.xaxis.label.set_fontsize(16)
         ax.yaxis.label.set_fontsize(16)
 
@@ -1443,11 +1989,9 @@ def plot_compression_study(
         ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
         ax.grid(True, color=_GRID, linewidth=0.8)
         ax.set_axisbelow(True)
-        for side in ('top', 'right'):
-            ax.spines[side].set_visible(False)
-        for side in ('left', 'bottom'):
-            ax.spines[side].set_color('#d8d7d2')
-        ax.tick_params(colors=_MUTED, labelsize=13)
+        for spine in ax.spines.values():
+            spine.set_color(_INK)
+        ax.tick_params(colors=_INK, labelsize=13)
         ax.xaxis.label.set_fontsize(16)
         ax.yaxis.label.set_fontsize(16)
 
@@ -1596,11 +2140,9 @@ def plot_compression_facets(
         ax.set_xlabel('Compression dimension', color=_INK)
         ax.grid(True, color=_GRID, linewidth=0.8)
         ax.set_axisbelow(True)
-        for side in ('top', 'right'):
-            ax.spines[side].set_visible(False)
-        for side in ('left', 'bottom'):
-            ax.spines[side].set_color('#d8d7d2')
-        ax.tick_params(colors=_MUTED, labelsize=12)
+        for spine in ax.spines.values():
+            spine.set_color(_INK)
+        ax.tick_params(colors=_INK, labelsize=12)
         ax.xaxis.label.set_fontsize(14)
 
     axes[0][0].set_ylabel(_PRETTY.get(metric, metric), color=_INK)

@@ -15,7 +15,11 @@ live in the config rather than in a shell loop:
 - ``ranks``: how many directions each chart keeps, crossed with
   ``charts`` so every factorisation is measured at every compression;
 - ``pilots``: the calibration budget ``N``, either absolute or derived
-  from the rate as ``ceil(symbols * multiplier)``.
+  from the rate as ``ceil(symbols * multiplier)``;
+- ``bandwidths``: optional, the RBF bandwidth of the residual stage. It
+  is the one axis that does not multiply the figure count -- it goes on
+  the colour channel of the same figure, because the reason to sweep it
+  is to see how the useful ``lambda`` window moves with it.
 
 So one invocation writes ``charts x ranks x budgets x metrics`` figures,
 and one CSV per ``(chart, rank, budget)`` cell. Every output is named
@@ -38,6 +42,7 @@ Examples
     uv run scripts/lambda_sweep.py 'charts=[{preprocess: pca}]'
     uv run scripts/lambda_sweep.py 'ranks=[384, 192, 96]'
     uv run scripts/lambda_sweep.py lam.min=1e-6 lam.max=1e-1 lam.per_decade=8
+    uv run scripts/lambda_sweep.py 'bandwidths=[0.25, 0.5, 1.0, 2.0]'
     uv run scripts/lambda_sweep.py plot_only=true
 """
 
@@ -75,8 +80,13 @@ from src.experiment import (
     resolve_symbols,
     usable_rank,
 )
-from src.plotting import plot_regularization_metric, use_project_style
+from src.plotting import (
+    plot_regularization_bandwidths,
+    plot_regularization_metric,
+    use_project_style,
+)
 from src.reporting import (
+    bandwidth_slug,
     chart_slug,
     figure_dir,
     lambda_stem,
@@ -134,6 +144,21 @@ def lambda_grid(cfg: DictConfig) -> list[float]:
     return [
         float(10.0 ** (low + i * (high - low) / (n - 1))) for i in range(n)
     ]
+
+
+def bandwidth_axis(cfg: DictConfig) -> list[float] | None:
+    """The kernel bandwidths to sweep, or ``None`` for the single curve.
+
+    ``None`` is not "one bandwidth": it means the axis does not exist and
+    the swept method keeps whatever ``bandwidth_scale`` its preset ships.
+    That distinction is what keeps an ordinary run writing the filenames
+    it has always written, and it is why a one-element list is still a
+    bandwidth run -- it is named as one, and drawn as one.
+    """
+    scales = cfg.get('bandwidths')
+    if not scales:
+        return None
+    return sorted(float(s) for s in scales)
 
 
 # ---------------------------------------------------------------------
@@ -284,14 +309,22 @@ def sweep_cell(
     symbols: int,
     n_pilots: int,
     grid: list[float],
+    bandwidths: list[float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
-    """One (chart, budget) cell: the swept curve and the flat baselines."""
+    """One (chart, budget) cell: the swept curve and the flat baselines.
+
+    With ``bandwidths`` the cell is a surface rather than a curve: the
+    swept method is fitted once per bandwidth and re-solved over the
+    whole lambda grid, so the axis costs one eigendecomposition per
+    bandwidth and nothing per lambda.
+    """
     metrics = list(cfg.eval.metrics)
     swept = str(cfg.sweep_method)
     repeats = range(int(cfg.pilots.n_repeats))
+    scales: list[float | None] = list(bandwidths or [None])
 
-    curve: dict[float, dict[str, list[float]]] = defaultdict(
-        lambda: defaultdict(list)
+    curve: dict[tuple[float | None, float], dict[str, list[float]]] = (
+        defaultdict(lambda: defaultdict(list))
     )
     flat: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
@@ -332,46 +365,61 @@ def sweep_cell(
         # recomputing one matrix. `set_lam` is exactly the fit a fresh
         # aligner would produce (tests/test_alignment.py pins that). A
         # method without it is refitted per lambda, as before.
-        for repeat in repeats:
-            for source, target in pairs:
-                pilots = paths[(source, repeat)][n_pilots]
-                aligner: Aligner | None = None
-                for lam in grid:
-                    # `lam_grid=None` matters as much as `lam`: left set,
-                    # the aligner holds out a slice of the pilots and
-                    # re-selects, and the point of a sweep is to see the
-                    # whole curve rather than be handed one point off it.
-                    if aligner is not None and hasattr(aligner, 'set_lam'):
-                        aligner.set_lam(float(lam))
-                    else:
-                        pinned = OmegaConf.merge(
-                            configured, {'lam': float(lam), 'lam_grid': None}
-                        )
-                        aligner = fit_on(
-                            build_aligner(pinned),
-                            pilots,
+        for scale in scales:
+            # Merged before the lambda loop, not inside it: the bandwidth
+            # is fixed at fit time and every lambda on the grid is a
+            # re-solve of that one fit.
+            at_scale = (
+                configured
+                if scale is None
+                else OmegaConf.merge(
+                    configured, {'bandwidth_scale': float(scale)}
+                )
+            )
+            for repeat in repeats:
+                for source, target in pairs:
+                    pilots = paths[(source, repeat)][n_pilots]
+                    aligner: Aligner | None = None
+                    for lam in grid:
+                        # `lam_grid=None` matters as much as `lam`: left
+                        # set, the aligner holds out a slice of the pilots
+                        # and re-selects, and the point of a sweep is to
+                        # see the whole curve rather than be handed one
+                        # point off it.
+                        if aligner is not None and hasattr(aligner, 'set_lam'):
+                            aligner.set_lam(float(lam))
+                        else:
+                            pinned = OmegaConf.merge(
+                                at_scale,
+                                {'lam': float(lam), 'lam_grid': None},
+                            )
+                            aligner = fit_on(
+                                build_aligner(pinned),
+                                pilots,
+                                agents,
+                                (source, target),
+                            )
+                        scores = evaluate(
+                            cfg,
+                            aligner,
                             agents,
                             (source, target),
+                            decoders.get(target),
                         )
-                    scores = evaluate(
-                        cfg,
-                        aligner,
-                        agents,
-                        (source, target),
-                        decoders.get(target),
-                    )
-                    for metric in metrics:
-                        curve[float(lam)][metric].append(scores[metric])
+                        for metric in metrics:
+                            curve[(scale, float(lam))][metric].append(
+                                scores[metric]
+                            )
 
-        for lam in grid:
-            log.info(
-                'N=%d lam=%.4g: %s',
-                n_pilots,
-                lam,
-                ', '.join(
-                    f'{m}={np.mean(curve[float(lam)][m]):.4f}' for m in metrics
-                ),
-            )
+            for lam in grid:
+                cell = curve[(scale, float(lam))]
+                log.info(
+                    'N=%d %slam=%.4g: %s',
+                    n_pilots,
+                    '' if scale is None else f'scale={scale:g} ',
+                    lam,
+                    ', '.join(f'{m}={np.mean(cell[m]):.4f}' for m in metrics),
+                )
 
     baselines = {
         name: {m: float(np.mean(v)) for m, v in values.items()}
@@ -381,12 +429,22 @@ def sweep_cell(
 
 
 def summarise(
-    curve: dict[float, dict[str, list[float]]], metrics: list[str]
+    curve: dict[tuple[float | None, float], dict[str, list[float]]],
+    metrics: list[str],
 ) -> list[dict[str, Any]]:
-    """Mean and spread over the (pair, repeat) cells at each ``lambda``."""
+    """Mean and spread over the (pair, repeat) cells at each point.
+
+    ``bandwidth_scale`` is written only when the run swept one, so an
+    ordinary sweep keeps the columns `pilot_sweep.py` has always read.
+    """
     rows = []
-    for lam, values in sorted(curve.items()):
-        row: dict[str, Any] = {'lam': lam, 'n_cells': len(values[metrics[0]])}
+    for (scale, lam), values in sorted(
+        curve.items(), key=lambda kv: (kv[0][0] or 0.0, kv[0][1])
+    ):
+        row: dict[str, Any] = (
+            {} if scale is None else {'bandwidth_scale': float(scale)}
+        )
+        row |= {'lam': lam, 'n_cells': len(values[metrics[0]])}
         for metric in metrics:
             row[f'{metric}_mean'] = float(np.mean(values[metric]))
             row[f'{metric}_std'] = float(np.std(values[metric]))
@@ -479,34 +537,29 @@ def split_baselines(
 # ---------------------------------------------------------------------
 
 
+def best_point(
+    rows: list[dict[str, Any]], metrics: list[str]
+) -> dict[str, dict[str, Any]]:
+    """The row maximising each metric.
+
+    The whole row, not just its ``lambda``: on a bandwidth run the answer
+    is a ``(bandwidth, lambda)`` pair and reporting half of it would name
+    a setting nobody can reproduce.
+    """
+    return {
+        metric: max(rows, key=lambda r: r[f'{metric}_mean'])
+        for metric in metrics
+    }
+
+
 def best_lambda(
     rows: list[dict[str, Any]], metrics: list[str]
 ) -> dict[str, float]:
     """The ``lambda`` maximising each metric."""
     return {
-        metric: float(max(rows, key=lambda r: r[f'{metric}_mean'])['lam'])
-        for metric in metrics
+        metric: float(row['lam'])
+        for metric, row in best_point(rows, metrics).items()
     }
-
-
-def cell_title(
-    cfg: DictConfig, chart: DictConfig, symbols: int | None, n_pilots: int
-) -> str:
-    """Figure title for one cell.
-
-    Built from words rather than from the filename slugs: the project
-    style renders titles through LaTeX where it is installed, and a slug
-    carrying underscores does not survive that.
-    """
-    if cfg.output.get('title'):
-        return str(cfg.output.title)
-    dataset = cfg.data.get('dataset', cfg.data.source)
-    rate = 'full width' if symbols is None else f'{symbols} symbols'
-    return (
-        f'RKA vs Procrustes — {dataset}, '
-        f'{chart.get("preprocess", "whiten")} chart, '
-        f'{rate}, {n_pilots} pilots'
-    )
 
 
 def draw(
@@ -516,9 +569,39 @@ def draw(
     reference: dict[str, float],
     directory: Path,
     stem: str,
-    title: str,
+    bandwidths: list[float] | None = None,
 ) -> list[Path]:
-    """One figure per metric, for one cell."""
+    """One figure per metric, for one cell.
+
+    Untitled unless ``output.title`` sets one: the cell is named by the
+    file, and a caption says the rest. The receiver's native accuracy is
+    drawn only with ``output.native_rx``.
+
+    A bandwidth run draws the same axes with the bandwidth on the colour
+    channel -- still one figure per metric, since the point of the axis
+    is to read the curves against each other.
+    """
+    title = cfg.output.get('title')
+    shared: dict[str, Any] = {
+        'baselines': baselines,
+        'reference': reference if cfg.output.native_rx else None,
+        'title': str(title) if title else None,
+        'formats': tuple(cfg.output.formats),
+        'panel': tuple(float(v) for v in cfg.output.panel),
+        'text_scale': float(cfg.output.text_scale),
+        'annotate': bool(cfg.output.annotate),
+    }
+    if bandwidths is not None:
+        return [
+            path
+            for metric in cfg.eval.metrics
+            for path in plot_regularization_bandwidths(
+                rows,
+                metric=str(metric),
+                out_path=directory / f'{stem}_{metric}',
+                **shared,
+            )
+        ]
     return [
         path
         for metric in cfg.eval.metrics
@@ -526,11 +609,8 @@ def draw(
             rows,
             metric=str(metric),
             out_path=directory / f'{stem}_{metric}',
-            baselines=baselines,
-            reference=reference,
-            title=title,
             method=str(cfg.sweep_method),
-            formats=tuple(cfg.output.formats),
+            **shared,
         )
     ]
 
@@ -579,6 +659,14 @@ def main(cfg: DictConfig) -> None:
         )
     flat_names = [name for name in cfg.methods if name != swept]
 
+    bandwidths = bandwidth_axis(cfg)
+    if bandwidths is not None and 'bandwidth_scale' not in cfg.methods[swept]:
+        raise SystemExit(
+            f'bandwidths= was given, but the swept method {swept!r} has no '
+            '`bandwidth_scale` -- only the kernel methods take one. Sweep a '
+            'method that has it, or drop the axis.'
+        )
+
     dataset = str(cfg.data.get('dataset', cfg.data.source))
     pairs, agents = resolve_star(cfg)
     log.info(
@@ -624,7 +712,7 @@ def main(cfg: DictConfig) -> None:
     )
     log.info(
         'd_r=%d, max_rank=%d -> %s; %d charts, %d cells, %d lambdas '
-        '(%.3g..%.3g).',
+        '(%.3g..%.3g)%s.',
         d_r,
         max_rank,
         f'compressing to {symbols} symbols'
@@ -635,6 +723,10 @@ def main(cfg: DictConfig) -> None:
         len(grid),
         grid[0],
         grid[-1],
+        ''
+        if bandwidths is None
+        else f', {len(bandwidths)} bandwidths '
+        f'({bandwidths[0]:g}..{bandwidths[-1]:g})',
     )
     # Spelled out per chart because the budgets are no longer one axis:
     # `pilots per symbol` is scaled to the rank each chart keeps, so a
@@ -660,7 +752,15 @@ def main(cfg: DictConfig) -> None:
         project=cfg.wandb.project,
         entity=cfg.wandb.entity,
         name=cfg.wandb.name
-        or f'lambda-{dataset}-{pairs_slug(pairs)}-{rate_slug(symbols)}',
+        or '-'.join(
+            (
+                'lambda',
+                dataset,
+                pairs_slug(pairs),
+                rate_slug(symbols),
+            )
+            + (() if bandwidths is None else (bandwidth_slug(bandwidths),))
+        ),
         group=cfg.wandb.group,
         job_type='lambda-sweep',
         tags=list(cfg.wandb.tags),
@@ -674,6 +774,7 @@ def main(cfg: DictConfig) -> None:
                 chart_slug(c): b for c, _, _, b in plan
             },
             'resolved_lam_grid': grid,
+            'resolved_bandwidths': bandwidths,
             'd_r': d_r,
         },
     )
@@ -688,7 +789,15 @@ def main(cfg: DictConfig) -> None:
             )
 
             for n_pilots in budgets:
-                stem = lambda_stem(dataset, pairs, chart, rank, n_pilots, grid)
+                stem = lambda_stem(
+                    dataset,
+                    pairs,
+                    chart,
+                    rank,
+                    n_pilots,
+                    grid,
+                    bandwidths=bandwidths,
+                )
                 path = results / f'{stem}.csv'
 
                 if path.exists() and (cfg.resume or cfg.plot_only):
@@ -728,6 +837,7 @@ def main(cfg: DictConfig) -> None:
                         symbols,
                         n_pilots,
                         grid,
+                        bandwidths,
                     )
                     rows = annotate(
                         rows,
@@ -756,10 +866,11 @@ def main(cfg: DictConfig) -> None:
                     reference,
                     figures,
                     stem,
-                    cell_title(cfg, chart, rank, n_pilots),
+                    bandwidths,
                 )
 
-                best = best_lambda(rows, metrics)
+                points = best_point(rows, metrics)
+                best = {m: float(r['lam']) for m, r in points.items()}
                 entry: dict[str, Any] = {
                     'chart': tag,
                     'symbols': rank,
@@ -769,6 +880,10 @@ def main(cfg: DictConfig) -> None:
                     peak = max(r[f'{metric}_mean'] for r in rows)
                     line = baselines.get('procrustes', {}).get(metric)
                     entry[f'lam_{metric}'] = best[metric]
+                    if bandwidths is not None:
+                        entry[f'bw_{metric}'] = float(
+                            points[metric]['bandwidth_scale']
+                        )
                     entry[f'rka_{metric}'] = peak
                     entry[f'proc_{metric}'] = line
                     entry[f'gain_{metric}'] = (
@@ -817,7 +932,11 @@ def main(cfg: DictConfig) -> None:
             + [
                 f'{part}_{metric}'
                 for metric in metrics
-                for part in ('lam', 'rka', 'proc', 'gain')
+                for part in (
+                    ('lam', 'bw', 'rka', 'proc', 'gain')
+                    if bandwidths is not None
+                    else ('lam', 'rka', 'proc', 'gain')
+                )
             ],
         )
     )

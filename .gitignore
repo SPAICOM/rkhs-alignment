@@ -16,6 +16,7 @@ multirun/
 # behind them. Same subdirectory layout under both.
 figures/
 results/
+paper/
 idea.md
 
 # Weights & Biases run data

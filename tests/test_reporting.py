@@ -20,6 +20,7 @@ from hydra import compose, initialize_config_dir
 from src.experiment import check_budgets_fit_pool
 from src.plotting import _with_extension
 from src.reporting import (
+    bandwidth_slug,
     budget_slug,
     chart_slug,
     dimension_fits_stem,
@@ -43,6 +44,7 @@ PAIRS = [
     ('regnety_016.pycls_in1k', 'vit_small_patch16_224.augreg_in1k'),
 ]
 GRID = [1e-8, 1e-4, 1e3]
+SCALES = [0.25, 1.0, 4.0]
 COUNTS = [423, 768, 3840]
 
 
@@ -101,6 +103,7 @@ def test_slugs_report_the_span_and_the_resolution_of_an_axis():
     assert lam_slug(GRID) != lam_slug([1e-8, 1e-6, 1e-4, 1e3])
     assert budget_slug(COUNTS) == 'N423to3840x3'
     assert ranks_slug([128, 16, 888]) == 'k16to888x3'
+    assert bandwidth_slug(SCALES) == 'bw0p25to4x3'
 
 
 # ---------------------------------------------------------------------
@@ -113,7 +116,18 @@ STEMS = [
     dimension_stem(
         'cifar10', PAIRS, CHART, 8192, 'herding', [16, 64, 888], 'linear'
     ),
+    dimension_stem(
+        'cifar10',
+        PAIRS,
+        CHART,
+        8192,
+        'herding',
+        [16, 64],
+        'linear',
+        seeds=[0, 1, 2],
+    ),
     dimension_fits_stem('cifar10', PAIRS, 8192, 'herding', 'linear'),
+    lambda_stem('cifar10', PAIRS, CHART, 384, 653, GRID, bandwidths=SCALES),
 ]
 
 
@@ -151,6 +165,15 @@ def test_cells_that_differ_in_any_axis_get_different_names():
         lambda_stem('cifar10', PAIRS, CHART, 384, 768, GRID),
         lambda_stem('cifar10', PAIRS, CHART, 384, 653, [1e-8, 1e3]),
         lambda_stem('cifar10', [('x', 'y')], CHART, 384, 653, GRID),
+        # A bandwidth run must not land on the single-bandwidth CSV it
+        # came from: `pilot_sweep.py` reads the best lambda per budget
+        # out of these and has no bandwidth column to filter on.
+        lambda_stem(
+            'cifar10', PAIRS, CHART, 384, 653, GRID, bandwidths=SCALES
+        ),
+        lambda_stem(
+            'cifar10', PAIRS, CHART, 384, 653, GRID, bandwidths=[0.5, 1.0]
+        ),
     ]
     assert len(set(variants)) == len(variants)
     assert base not in variants
@@ -278,8 +301,10 @@ def test_the_dimension_study_reads_what_the_lambda_study_wrote():
     assert set(dims.read_back.methods) <= set(lam.methods)
     assert dims.read_back.metric in lam.eval.metrics
     assert set(dims.eval.metrics) <= set(lam.eval.metrics)
-    # The check refits exactly the preset whose numbers it compares with.
-    assert dims.verify.method == lam.methods.procrustes
+    # Refits -- the check, and every seed -- use exactly the presets whose
+    # numbers the lambda sweep wrote.
+    for name in dims.read_back.methods:
+        assert dims.refit[name] == lam.methods[name], name
 
 
 def test_the_dimension_study_fits_methods_it_does_not_read_back():
@@ -465,6 +490,9 @@ def test_seeds_are_averaged_within_a_pair_before_the_spread_over_pairs():
     assert point['n_pairs'] == 2
     assert point['accuracy_mean'] == pytest.approx(0.86)
     assert point['accuracy_std'] == pytest.approx(0.04)
+    # Sample sd over the two pair means is 0.08 / sqrt(2), so the standard
+    # error is 0.04, scaled by the t quantile at one degree of freedom.
+    assert point['accuracy_ci95'] == pytest.approx(12.7062047 * 0.04)
 
 
 def test_a_pair_missing_a_point_is_reported_not_averaged_over():
@@ -478,3 +506,90 @@ def test_a_pair_missing_a_point_is_reported_not_averaged_over():
         rows, ['a', 'b'], ('method', 'requested'), [('rkhs', 16), ('rkhs', 32)]
     )
     assert missing == {'b': [('rkhs', 32)]}
+
+
+def test_a_seeded_dimension_run_never_takes_the_single_runs_name():
+    single = dimension_stem(
+        'cifar10', PAIRS, CHART, 8192, 'herding', [16, 64], 'linear'
+    )
+    seeded = dimension_stem(
+        'cifar10', PAIRS, CHART, 8192, 'herding', [16, 64], 'linear', [0, 1]
+    )
+    assert single != seeded
+    assert single.endswith('dec-linear')
+
+
+def write_rows(path, rows):
+    """A CSV with the union of the rows' columns, blanks for the rest."""
+    fields = list(dict.fromkeys(k for row in rows for k in row))
+    with path.open('w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_the_pair_average_reads_only_the_seeds_it_is_given(tmp_path):
+    """A pair that has run more seeds than the list must not weigh them in."""
+    module = pair_average_script()
+    base = {
+        'pairs': 'a-to-b',
+        'chart': 'whiten-k32',
+        'symbols': 32,
+        'n_pilots': 128,
+        'strategy': 'herding',
+        'method': 'rkhs',
+    }
+    write_rows(
+        tmp_path / 'pilots_a_seed0.csv',
+        [base | {'seed': s, 'accuracy': 0.8 + s / 100} for s in (0, 1, 2)],
+    )
+    rows = module.pilot_records(
+        tmp_path, ['a-to-b'], 'whiten-k32', 32, [128], ['herding'], [0, 1]
+    )
+    assert sorted(r['seed'] for r in rows) == [0, 1]
+
+
+def test_dimension_rows_keep_every_seed_or_only_the_single_run(tmp_path):
+    module = pair_average_script()
+    base = {
+        'pairs': 'a-to-b',
+        'base_chart': 'whiten',
+        'n_pilots': 8192,
+        'strategy': 'herding',
+        'method': 'rkhs',
+        'requested': 32,
+    }
+    # The single realisation, written before seeds existed: no column.
+    write_rows(tmp_path / 'dims_single.csv', [base | {'accuracy': 0.9}])
+    write_rows(
+        tmp_path / 'dims_seeded.csv',
+        [base | {'seed': s, 'accuracy': 0.8 + s / 100} for s in (0, 1)],
+    )
+    args = (tmp_path, ['a-to-b'], 'whiten', 8192, 'herding', [32])
+
+    single = module.dimension_rows(*args, None)
+    assert [r['accuracy'] for r in single] == [0.9]
+
+    seeded = module.dimension_rows(*args, [0, 1])
+    assert sorted(r['seed'] for r in seeded) == [0, 1]
+    # Both seeds survive to be averaged within the pair.
+    (point,) = module.average_over_pairs(
+        seeded, ('method', 'requested'), ['accuracy']
+    )
+    assert point['accuracy_mean'] == pytest.approx(0.805)
+
+
+def test_a_pair_missing_a_seed_is_reported():
+    module = pair_average_script()
+    rows = [
+        {'pairs': 'a', 'method': 'rkhs', 'requested': 16, 'seed': 0},
+        {'pairs': 'a', 'method': 'rkhs', 'requested': 16, 'seed': 1},
+        {'pairs': 'b', 'method': 'rkhs', 'requested': 16, 'seed': 0},
+    ]
+    missing = module.missing_points(
+        rows,
+        ['a', 'b'],
+        ('method', 'requested', 'seed'),
+        [('rkhs', 16, 0), ('rkhs', 16, 1)],
+    )
+    assert missing == {'b': [('rkhs', 16, 1)]}

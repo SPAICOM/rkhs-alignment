@@ -34,12 +34,15 @@ defaults:
   # and take the rate through `n_canonical`.
   - alignment@methods.cca: cca
   - alignment@methods.svcca: svcca
-  # Proto-PFE does take the chart -- see `charted` below.
+  # Proto-PFE takes no chart either: its rate is the number of anchors,
+  # so truncating the latents as well would compress twice -- see
+  # `charted` below.
   - alignment@methods.ppfe: ppfe
-  # --- the consistency check ----------------------------------------------
-  # Refitted per (chart, rank) and compared with the Procrustes numbers
-  # the lambda sweep wrote; see `verify`.
-  - alignment@verify.method: procrustes
+  # --- the read-back methods, for refitting ---------------------------
+  # Used by the consistency check (`verify`, Procrustes only) and, when
+  # `seeds` is set, to refit Procrustes and RKA on every seed's pilots.
+  - alignment@refit.procrustes: procrustes
+  - alignment@refit.rkhs: rkhs
   - _self_
 
 # Seeds the candidate pool and the pilot selection. Has to equal
@@ -78,16 +81,36 @@ pilots:
   # Must match the lambda sweep's design; the lookup filters on it.
   strategy: herding
 
+# --- pilot realisations -----------------------------------------------
+# null: one realisation, the lambda sweep's own pilots (drawn with `seed`
+# above). RKA and Procrustes are then read back from its CSVs, verified,
+# and only the methods in `methods` are fitted.
+#
+# A list: one realisation per entry, each drawing its own pool and pilots
+# exactly as `pilot_sweep.py` does for that seed -- so seed s here and
+# there share their pilots at N = n_pilots. RKA and Procrustes can no
+# longer be read back (the lambda sweep measured one pilot set), so both
+# are refitted per seed, RKA at the lambda the sweep selected for that
+# (chart, rank) -- the rule `pilot_sweep.py` applies. Every method is
+# fitted per seed, every row carries its seed, and the figure is mean
+# +/- sd over seeds.
+#
+#   uv run scripts/dimension_sweep.py 'seeds=[0,1,2,3,4]'
+seeds: null
+
 # --- which fitted methods take the chart -------------------------------
-# Merged with every chart and rank exactly as RKA and Procrustes were in
-# the lambda sweep, so they work on the same truncated-whitened
-# coordinates. Proto-PFE belongs here: its rate is the number of anchors,
-# and its preset's `standard` scaling would put it on a different chart.
-# Whitening at *full* width is not the alternative -- measured on
-# regnety_016 -> vit_large at N=8192, k anchors in a flattened 888-dim
-# spectrum collapse (accuracy 0.48 at k=32, against 0.84 on whiten-k32).
-# Every other fitted method takes no chart, for the reason given above.
-charted: [ppfe]
+# A method listed here is merged with every chart and rank exactly as RKA
+# and Procrustes were in the lambda sweep. None is, by default.
+#
+# Proto-PFE was, once, and it should not be: its rate is the frame size,
+# so on the `whiten-k` chart k anchors in k dimensions make a square
+# Parseval frame -- an orthonormal basis -- and the compression is done by
+# the PCA truncation instead of by the anchors. Untruncated, it runs with
+# its preset's `standard` scaling. Whitening the full width is not an
+# option: k anchors cannot span a flattened 768-1280-dim spectrum, and on
+# the five `pair_average` pairs at N=8192 accuracy falls to 0.23-0.48 at
+# k=32, against 0.76-0.85 with standard scaling.
+charted: []
 
 # The fitted methods standardise from the pilots alone, as the lambda
 # sweep's charts do. `true` lets SVCCA estimate its SVD basis from all of
@@ -104,6 +127,9 @@ use_local_context: false
 verify:
   enabled: true
   tolerance: 5.0e-4
+  # With `seeds` set this still runs on the lambda sweep's own pilots, so
+  # it costs one extra pilot selection per run; `verify.enabled=false`
+  # skips it once a pair is known to match.
 
 # --- receiver decoder -------------------------------------------------
 # Must be the head the lambda sweep scored with -- `verify` catches it if

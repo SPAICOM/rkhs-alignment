@@ -19,16 +19,23 @@ the design:
   pilots: same seed, same pool, same design. CCA and SVCCA take no chart:
   CCA is invariant to any invertible map of either space, so whitening it
   changes nothing, and SVCCA's SVD ranks exactly the spectrum whitening
-  would flatten; their rate goes through ``n_canonical``. The methods in
-  ``charted`` -- Proto-PFE -- are fitted per ``(chart, rank)`` on the
-  truncated-whitened coordinates RKA and Procrustes had, with the rate in
-  their own knob (the anchor count).
+  would flatten; their rate goes through ``n_canonical``. Proto-PFE takes
+  no chart either -- its rate is the anchor count. A method listed in
+  ``charted`` would instead be fitted per ``(chart, rank)`` on the
+  truncated-whitened coordinates RKA and Procrustes had.
 
 Reading one set of numbers back and fitting the other is only sound if
 both saw the same pilots, decoder and preprocessing, and the lambda
 sweep's CSVs record none of those. So the run checks it: Procrustes is
 refitted per ``(chart, rank)`` and compared with the value in the CSV
 before anything is drawn.
+
+With ``seeds`` set the figure is an average over pilot realisations
+instead. The lambda sweep measured one pilot set, so nothing can be read
+back: every seed draws its own pilots, exactly as ``pilot_sweep.py`` does
+for that seed, and every method is fitted on them -- RKA at the lambda the
+sweep selected for that ``(chart, rank)``. Each row keeps its seed, so a
+study pooling several pairs can average within a pair first.
 
 Every rank has to sit strictly below ``N``. At ``N <= k`` the whitened
 chart is rank-deficient and RKA's residual has no degrees of freedom, so
@@ -46,6 +53,7 @@ Examples
     uv run scripts/dimension_sweep.py pilots.n_pilots=4096
     uv run scripts/dimension_sweep.py 'ranks=[16, 32, 64, 128]'
     uv run scripts/dimension_sweep.py plot_only=true
+    uv run scripts/dimension_sweep.py 'seeds=[0,1,2,3,4]'
 """
 
 from __future__ import annotations
@@ -211,13 +219,14 @@ def check_ranks_below_budget(rates: list[int], n_pilots: int) -> None:
 
 
 class PilotSet:
-    """The lambda sweep's pilots for every source, selected on first use.
+    """One realisation's pilots for every source, selected on first use.
 
-    Built the way ``lambda_sweep.pilot_paths`` builds its first repeat --
-    same pool, same design, same seed -- so a fitted method sees the very
-    samples the read-back ones were measured on. Deferred because a
-    resumed run that has nothing to fit and verification switched off
-    should not pay for a kernel-herding pass over the training split.
+    Drawn the way both other studies draw them -- ``draw_pool`` then
+    ``select_pilot_path`` with the same seed for both -- so ``seed=cfg.seed``
+    reproduces the lambda sweep's first repeat, and any other seed
+    reproduces that seed of ``pilot_sweep.py`` at ``N = n_pilots``. Deferred
+    because a resumed run that has nothing to fit and verification switched
+    off should not pay for a kernel-herding pass over the training split.
     """
 
     def __init__(
@@ -225,25 +234,29 @@ class PilotSet:
         cfg: DictConfig,
         pairs: list[tuple[str, str]],
         agents: dict[str, dict[str, LatentSpace]],
+        seed: int,
     ) -> None:
         self._cfg, self._pairs, self._agents = cfg, pairs, agents
+        self.seed = int(seed)
         self._indices: dict[str, np.ndarray] | None = None
 
     def __getitem__(self, source: str) -> np.ndarray:
         if self._indices is None:
             cfg = self._cfg
             n = int(cfg.pilots.n_pilots)
-            seed = int(cfg.seed)
+            seed = self.seed
             self._indices = {}
             for name in dict.fromkeys(s for s, _ in self._pairs):
                 train = self._agents[name]['train']
                 pool = draw_pool(train, cfg.pilots.pool_size, seed)
                 log.info(
-                    'Selecting %d %s pilots for %s from a pool of %d.',
+                    'Selecting %d %s pilots for %s from a pool of %d '
+                    '(seed %d).',
                     n,
                     cfg.pilots.strategy,
                     name,
                     pool.size,
+                    seed,
                 )
                 labels = train.labels
                 within = select_pilot_path(
@@ -264,11 +277,15 @@ def fit_and_score(
     agents: dict[str, dict[str, LatentSpace]],
     pairs: list[tuple[str, str]],
     decoders: dict[str, Decoder | None],
+    seed: int | None = None,
 ) -> tuple[dict[str, float], int]:
     """Fit one configured method on every pair; mean metrics, realised rate.
 
     The rate is the smallest any pair delivered, so a point is never
-    plotted at more symbols than one of its pairs actually sent.
+    plotted at more symbols than one of its pairs actually sent. ``seed``
+    overrides the preset's own (the config seed) for a per-realisation
+    fit, as ``pilot_sweep.py`` does; ``None`` leaves the preset untouched,
+    which is what makes a fit on the lambda sweep's pilots reproduce it.
     """
     metrics = list(cfg.eval.metrics)
     scores: dict[str, list[float]] = defaultdict(list)
@@ -284,7 +301,9 @@ def fit_and_score(
                 'tgt_context': tgt_train.latent,
             }
         labels = src_train.labels
-        aligner: Aligner = build_aligner(method_cfg)
+        aligner: Aligner = build_aligner(
+            method_cfg, **({} if seed is None else {'seed': seed})
+        )
         aligner.fit(
             src_train.latent[idx],
             tgt_train.latent[idx],
@@ -338,7 +357,7 @@ def read_rows(path: Path) -> list[dict[str, Any]]:
                     parsed[key] = float(value)
                 except (TypeError, ValueError):
                     parsed[key] = value or None
-            for key in ('rank', 'requested', 'symbols', 'n_pilots'):
+            for key in ('rank', 'requested', 'symbols', 'n_pilots', 'seed'):
                 if isinstance(parsed.get(key), float):
                     parsed[key] = int(parsed[key])
             rows.append(parsed)
@@ -444,6 +463,17 @@ def main(cfg: DictConfig) -> None:
     n_pilots = int(cfg.pilots.n_pilots)
     strategy = str(cfg.pilots.strategy)
     decoder_kind = str(cfg.decoder.kind) if cfg.decoder.enabled else 'none'
+    seeds = [int(x) for x in cfg.seeds] if cfg.get('seeds') else None
+    if seeds and len(set(seeds)) != len(seeds):
+        raise SystemExit(f'seeds={seeds} repeats a seed.')
+    needs_refit = set(read_names) if seeds else set()
+    if cfg.verify.enabled:
+        needs_refit.add('procrustes')
+    if needs_refit - set(cfg.refit):
+        raise SystemExit(
+            f'{sorted(needs_refit - set(cfg.refit))} must be refitted '
+            '(for `seeds` or `verify`) but have no preset under `refit`.'
+        )
     if cfg.verify.enabled and 'procrustes' not in read_names:
         raise SystemExit(
             'verify.enabled=true checks the read-back Procrustes numbers, '
@@ -519,19 +549,23 @@ def main(cfg: DictConfig) -> None:
         )
 
     log.info(
-        'max_rank=%d; %d charts x %d ranks (%s) at N=%d %s pilots; read '
-        'back %s, fitting %s.',
+        'max_rank=%d; %d charts x %d ranks (%s) at N=%d %s pilots; %s.',
         max_rank,
         len(plan),
         len(rates),
         ', '.join(str(r) for r in rates),
         n_pilots,
         strategy,
-        ', '.join(read_names),
-        ', '.join(fit_names),
+        f'{len(seeds)} seeds ({", ".join(map(str, seeds))}), refitting '
+        f'{", ".join(read_names + fit_names)} on each'
+        if seeds
+        else f'read back {", ".join(read_names)}, fitting '
+        f'{", ".join(fit_names)} on the lambda sweep pilots',
     )
 
-    pilots = PilotSet(cfg, pairs, agents)
+    # The lambda sweep's own pilots: what `verify` refits on, and the one
+    # realisation when `seeds` is null.
+    lambda_pilots = PilotSet(cfg, pairs, agents, int(cfg.seed))
     use_project_style(ROOT / 'config' / 'plotting' / 'plt.mplstyle')
 
     run = wandb.init(
@@ -556,8 +590,8 @@ def main(cfg: DictConfig) -> None:
                     tag = chart_slug(chart)
                     refit, _ = fit_and_score(
                         cfg,
-                        configure_method(cfg.verify.method, chart, rank),
-                        pilots,
+                        configure_method(cfg.refit.procrustes, chart, rank),
+                        lambda_pilots,
                         agents,
                         pairs,
                         decoders,
@@ -587,10 +621,14 @@ def main(cfg: DictConfig) -> None:
                         )
 
         # --- the fitted methods -------------------------------------
-        # A charted method is fitted per (chart, rank), on the coordinates
-        # the read-back methods had; the rest take no chart, so one fit
-        # per rank serves every chart. Records are keyed on all three, and
-        # a row written before `charted` existed carries no chart column.
+        # One realisation (`seeds: null`) fits only `methods`, on the lambda
+        # sweep's own pilots, and reads RKA and Procrustes back. With seeds,
+        # every realisation fits everything -- the read-back methods too, on
+        # their chart, RKA at the lambda the sweep selected for that cell.
+        # A method on a chart is fitted per (chart, rank); the rest take
+        # none, so one fit per rank serves every chart. Records are keyed on
+        # (method, chart, rank, seed); a row written before either axis
+        # existed reads as chart `none`, seed `None` -- the one realisation.
         charted = {str(m) for m in cfg.charted}
         unknown = charted - set(fit_names)
         if unknown:
@@ -598,17 +636,21 @@ def main(cfg: DictConfig) -> None:
                 f'charted={sorted(unknown)} names no method in `methods` '
                 f'({", ".join(fit_names)}).'
             )
-        cells: list[tuple[str, str, DictConfig, int]] = []
-        for name in fit_names:
-            if name in charted:
+        on_chart = charted | (set(read_names) if seeds else set())
+        fit_order = (read_names if seeds else []) + fit_names
+        realisations: list[int | None] = list(seeds) if seeds else [None]
+
+        cells: list[tuple[str, str, DictConfig, int | None, int]] = []
+        for name in fit_order:
+            if name in on_chart:
                 cells += [
-                    (name, chart_slug(chart), chart, rate)
+                    (name, chart_slug(chart), chart, rank, rate)
                     for _, ranks in plan
-                    for chart, _, rate in ranks
+                    for chart, rank, rate in ranks
                 ]
             else:
                 cells += [
-                    (name, 'none', OmegaConf.create({}), rate)
+                    (name, 'none', OmegaConf.create({}), rate, rate)
                     for rate in rates
                 ]
 
@@ -620,63 +662,98 @@ def main(cfg: DictConfig) -> None:
         )
         fits = read_rows(fits_path) if (cfg.resume or cfg.plot_only) else []
         have = {
-            (r['method'], r.get('chart') or 'none', r['requested'])
+            (
+                r['method'],
+                r.get('chart') or 'none',
+                r['requested'],
+                r.get('seed'),
+            )
             for r in fits
         }
-        for name, tag, chart, rate in cells:
-            if (name, tag, rate) in have:
-                continue
-            if cfg.plot_only:
-                log.warning(
-                    'plot_only=true and %s at chart=%s k=%d is not on disk; '
-                    'it will be missing from the figure.',
+        pilot_sets: dict[int, PilotSet] = {}
+        for seed in realisations:
+            for name, tag, chart, rank, rate in cells:
+                if (name, tag, rate, seed) in have:
+                    continue
+                if cfg.plot_only:
+                    log.warning(
+                        'plot_only=true and %s at chart=%s k=%d seed=%s is '
+                        'not on disk; it will be missing from the figure.',
+                        name,
+                        tag,
+                        rate,
+                        seed,
+                    )
+                    continue
+                if seed is None:
+                    pilots = lambda_pilots
+                else:
+                    pilots = pilot_sets.setdefault(
+                        seed, PilotSet(cfg, pairs, agents, seed)
+                    )
+                lam = None
+                if name in read_names:
+                    # Refitted exactly as the lambda sweep fitted it: the
+                    # rank goes in as the sweep resolved it, and RKA takes
+                    # the lambda that sweep selected for this cell.
+                    method_cfg = configure_method(cfg.refit[name], chart, rank)
+                    if name == str(cfg.read_back.swept):
+                        lam = backs[(tag, rank)]['lam']
+                        method_cfg = OmegaConf.merge(
+                            method_cfg, {'lam': lam, 'lam_grid': None}
+                        )
+                else:
+                    # The rate goes in as a number even when the chart is
+                    # untruncated: a method whose rate knob is not a width
+                    # (the anchor count, say) has no "full" setting.
+                    method_cfg = configure_method(
+                        cfg.methods[name], chart, rate
+                    )
+                values, delivered = fit_and_score(
+                    cfg,
+                    method_cfg,
+                    pilots,
+                    agents,
+                    pairs,
+                    decoders,
+                    seed=seed,
+                )
+                if delivered != rate:
+                    log.warning(
+                        '%s asked for %d symbols delivered %d; it is drawn '
+                        'at %d.',
+                        name,
+                        rate,
+                        delivered,
+                        delivered,
+                    )
+                log.info(
+                    'seed=%s k=%d %s (chart=%s): %s',
+                    seed,
+                    rate,
                     name,
                     tag,
-                    rate,
+                    '  '.join(f'{m}={v:.4f}' for m, v in values.items()),
                 )
-                continue
-            # The rate goes in as a number even when the chart is
-            # untruncated: a method whose rate knob is not a width (the
-            # anchor count, say) has no "full" setting to fall back on.
-            values, delivered = fit_and_score(
-                cfg,
-                configure_method(cfg.methods[name], chart, rate),
-                pilots,
-                agents,
-                pairs,
-                decoders,
-            )
-            if delivered != rate:
-                log.warning(
-                    '%s asked for %d symbols delivered %d; it is drawn at %d.',
-                    name,
-                    rate,
-                    delivered,
-                    delivered,
+                fits.append(
+                    {
+                        'dataset': dataset,
+                        'pairs': pairs_tag,
+                        'strategy': strategy,
+                        'n_pilots': n_pilots,
+                        'seed': seed,
+                        'method': name,
+                        'chart': tag,
+                        'requested': rate,
+                        'symbols': delivered,
+                        'lam': lam,
+                        **values,
+                    }
                 )
-            log.info(
-                'k=%d %s (chart=%s): %s',
-                rate,
-                name,
-                tag,
-                '  '.join(f'{m}={v:.4f}' for m, v in values.items()),
-            )
-            fits.append(
-                {
-                    'dataset': dataset,
-                    'pairs': pairs_tag,
-                    'strategy': strategy,
-                    'n_pilots': n_pilots,
-                    'method': name,
-                    'chart': tag,
-                    'requested': rate,
-                    'symbols': delivered,
-                    **values,
-                }
-            )
-            write_rows(fits_path, fits)
+                write_rows(fits_path, fits)
 
         # --- one figure per base chart -------------------------------
+        wanted_seeds = set(realisations)
         for base, ranks in plan:
             # Every row names the run it came from, so a study that pools
             # several of these CSVs (`pair_average.py`) can filter on
@@ -689,46 +766,115 @@ def main(cfg: DictConfig) -> None:
                 'strategy': strategy,
                 'decoder': decoder_kind,
             }
-            summary: list[dict[str, Any]] = []
-            for chart, rank, rate in ranks:
-                cell = backs[(chart_slug(chart), rank)]
-                summary.extend(
-                    identity
-                    | {
-                        'method': name,
-                        'chart': chart_slug(chart),
-                        'requested': rate,
-                        'symbols': rate,
-                        'lam': cell['lam']
-                        if name == cfg.read_back.swept
-                        else None,
-                        'source': str(cfg.read_back.study),
-                        **cell['values'][name],
-                    }
-                    for name in read_names
-                )
             chart_rates = {rate for *_, rate in ranks}
-            chart_tags = {chart_slug(chart) for chart, *_ in ranks} | {'none'}
+            chart_tags = {chart_slug(chart) for chart, *_ in ranks}
+
+            def as_configured(row: dict[str, Any]) -> bool:
+                """Fitted the way the method is configured *now*: a method
+                moved on or off a chart leaves its old records cached."""
+                tag = row.get('chart') or 'none'
+                if row['method'] in on_chart:
+                    return tag in chart_tags
+                return tag == 'none'
+
+            summary: list[dict[str, Any]] = []
+            if not seeds:
+                for chart, rank, rate in ranks:
+                    cell = backs[(chart_slug(chart), rank)]
+                    summary.extend(
+                        identity
+                        | {
+                            'method': name,
+                            'chart': chart_slug(chart),
+                            'requested': rate,
+                            'symbols': rate,
+                            'lam': cell['lam']
+                            if name == cfg.read_back.swept
+                            else None,
+                            'source': str(cfg.read_back.study),
+                            **cell['values'][name],
+                        }
+                        for name in read_names
+                    )
             summary += [
                 identity
                 | {
+                    'seed': r.get('seed'),
                     'method': r['method'],
                     'chart': r.get('chart') or 'none',
                     'requested': r['requested'],
                     'symbols': r['symbols'],
-                    'lam': None,
+                    'lam': r.get('lam'),
                     'source': 'fitted',
                     **{m: r.get(m) for m in metrics},
                 }
                 for r in fits
-                if r['method'] in fit_names
+                if r['method'] in fit_order
                 and r['requested'] in chart_rates
-                and (r.get('chart') or 'none') in chart_tags
+                and r.get('seed') in wanted_seeds
+                and as_configured(r)
             ]
             rank_of = {name: i for i, name in enumerate(order)}
             summary.sort(
-                key=lambda r: (rank_of.get(r['method'], 99), r['requested'])
+                key=lambda r: (
+                    rank_of.get(r['method'], 99),
+                    r['requested'],
+                    -1 if r.get('seed') is None else r['seed'],
+                )
             )
+
+            # The figure and the table read one point per (method, rank):
+            # with seeds, the mean over them and its spread. The CSV keeps
+            # every seed, so a pooled study can average within the pair.
+            shown = summary
+            if seeds:
+                grouped: dict[tuple[str, int], list[dict[str, Any]]] = (
+                    defaultdict(list)
+                )
+                for row in summary:
+                    grouped[(row['method'], row['requested'])].append(row)
+                shown = []
+                for (method, k), group in grouped.items():
+                    point: dict[str, Any] = {
+                        'method': method,
+                        'requested': k,
+                        'symbols': min(g['symbols'] for g in group),
+                        'n_seeds': len(group),
+                    }
+                    for metric in metrics:
+                        values = [
+                            g[metric]
+                            for g in group
+                            if g.get(metric) is not None
+                        ]
+                        if not values:
+                            continue
+                        point[metric] = point[f'{metric}_mean'] = float(
+                            np.mean(values)
+                        )
+                        point[f'{metric}_std'] = float(np.std(values))
+                    shown.append(point)
+                shown.sort(
+                    key=lambda r: (
+                        rank_of.get(r['method'], 99),
+                        r['requested'],
+                    )
+                )
+                short = sorted(
+                    {
+                        (p['method'], p['requested'])
+                        for p in shown
+                        if p['n_seeds'] < len(seeds)
+                    }
+                )
+                if short:
+                    log.warning(
+                        'Uneven seed coverage: %d (method, rank) points have '
+                        'fewer than %d seeds, e.g. %s.',
+                        len(short),
+                        len(seeds),
+                        short[0],
+                    )
 
             tag = chart_slug(base)
             stem = dimension_stem(
@@ -739,14 +885,16 @@ def main(cfg: DictConfig) -> None:
                 strategy,
                 sorted(chart_rates),
                 decoder_kind,
+                seeds=seeds,
             )
             write_rows(results / f'{stem}.csv', summary)
             title = cfg.output.get('title') or (
                 f'Compression — {dataset}, {base.get("preprocess", "whiten")} '
                 f'chart, N={n_pilots} {strategy} pilots'
+                + (f', {len(seeds)} seeds' if seeds else '')
             )
             written += plot_dimension_sweep(
-                summary,
+                shown,
                 metrics=metrics,
                 out_path=figure_dir(
                     cfg.output.figures, str(cfg.output.study), dataset, tag
@@ -758,8 +906,12 @@ def main(cfg: DictConfig) -> None:
                 formats=tuple(cfg.output.formats),
             )
 
-            print(f'\n{tag} — {pairs_tag}, N={n_pilots} {strategy} pilots\n')
-            print(summary_table(summary, metrics, order))
+            print(
+                f'\n{tag} — {pairs_tag}, N={n_pilots} {strategy} pilots'
+                + (f', mean over seeds {seeds}' if seeds else '')
+                + '\n'
+            )
+            print(summary_table(shown, metrics, order))
 
             table = wandb.Table(columns=list(summary[0]))
             for row in summary:

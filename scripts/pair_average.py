@@ -4,12 +4,14 @@
 with the band over pilot realisations. Whether a gap belongs to the method
 or to the pair is a different question, and this script answers it: it
 fits nothing, pools what those two studies already wrote for every pair in
-the config, and redraws both figures with the band over *pairs*.
+the config, and redraws both figures with the error bars over *pairs*.
 
 The order of averaging is the point. Seeds are averaged within a pair
-first, then mean and standard deviation are taken across pairs, so the
-band is the spread between encoder pairs and does not shrink because one
-pair happened to be run with more seeds.
+first, then mean, standard deviation and a 95% t-interval on the mean are
+taken across pairs, so the error bar is the spread between encoder pairs
+and does not shrink because one pair happened to be run with more seeds.
+Which seeds is fixed by ``pilot.seeds`` and ``dimension.seeds``: only
+those are read, and every pair must have all of them.
 
 Everything is matched on the CSVs' columns -- ``pairs``, ``chart``,
 ``symbols``, ``n_pilots``, ``strategy`` -- never on their filenames, as in
@@ -25,7 +27,8 @@ an average can hide a pair where the ordering flips.
 Examples
 --------
     just pair-average
-    uv run scripts/pair_average.py 'pilot.drop=[direct_mlp:round_robin]'
+    uv run scripts/pair_average.py 'pilot.drop=[]' interval=std
+    uv run scripts/pair_average.py 'pilot.seeds=[0,1,2,3]' dimension.seeds=null
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ from typing import Any
 import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
+from scipy import stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -120,8 +124,14 @@ def pilot_records(
     symbols: int,
     counts: list[int],
     strategies: list[str],
+    seeds: list[int],
 ) -> list[dict[str, Any]]:
-    """Every per-seed pilot-sweep record describing one of the pairs."""
+    """Every pilot-sweep record describing one of the pairs, at ``seeds``.
+
+    Seeds outside the list are left out even when they are on disk, so a
+    pair that has run more realisations than another does not weigh them
+    into the curve while the other catches up.
+    """
     wanted, budgets, designs = set(tags), set(counts), set(strategies)
     return [
         row
@@ -132,6 +142,7 @@ def pilot_records(
         and row.get('symbols') == symbols
         and row.get('n_pilots') in budgets
         and row.get('strategy') in designs
+        and row.get('seed') in seeds
     ]
 
 
@@ -142,15 +153,20 @@ def dimension_rows(
     n_pilots: int,
     strategy: str,
     ranks: list[int],
+    seeds: list[int] | None,
 ) -> list[dict[str, Any]]:
-    """One dimension-sweep point per ``(pair, method, rank)``.
+    """One dimension-sweep point per ``(pair, method, rank, seed)``.
 
-    A pair can have several summaries on disk -- one per rank axis it was
-    drawn over -- and they describe the same fits. The newest file wins
-    each point, so a rerun after a fix supersedes what it fixed.
+    ``seeds=None`` takes the single realisation on the lambda sweep's own
+    pilots: rows written without a seed. A list takes the rows of those
+    seeds, and only those. A pair can have several summaries on disk --
+    one per rank axis or seed list it was drawn over -- and they describe
+    the same fits. The newest file wins each point, so a rerun after a fix
+    supersedes what it fixed.
     """
     wanted, axis = set(tags), set(ranks)
-    points: dict[tuple[str, str, int], dict[str, Any]] = {}
+    realisations = {None} if seeds is None else set(seeds)
+    points: dict[tuple[str, str, int, int | None], dict[str, Any]] = {}
     paths = sorted(
         directory.glob('dims_*.csv'), key=lambda p: p.stat().st_mtime
     )
@@ -162,8 +178,10 @@ def dimension_rows(
                 and row.get('n_pilots') == n_pilots
                 and row.get('strategy') == strategy
                 and row.get('requested') in axis
+                and row.get('seed') in realisations
             ):
-                points[(row['pairs'], row['method'], row['requested'])] = row
+                key = (row['pairs'], row['method'], row['requested'])
+                points[(*key, row.get('seed'))] = row
     return list(points.values())
 
 
@@ -177,11 +195,15 @@ def average_over_pairs(
     keys: tuple[str, ...],
     metrics: list[str],
 ) -> list[dict[str, Any]]:
-    """Mean within each pair over its repeats, then mean +/- sd over pairs.
+    """Mean within each pair over its repeats, then summarised over pairs.
 
     ``keys`` name one point of the curve (``method``, ``strategy``,
     ``n_pilots`` for the pilot figure). Whatever else varies within a
     ``(pair, *keys)`` group -- seeds -- is averaged away first.
+
+    Each metric gets ``_mean``, ``_std`` (population, over pairs) and
+    ``_ci95``: the half-width of the 95% Student-t interval on the mean,
+    which is zero with a single pair since there is no spread to estimate.
     """
     within: dict[tuple, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
@@ -204,8 +226,18 @@ def average_over_pairs(
         row: dict[str, Any] = dict(zip(keys, point))
         row['n_pairs'] = len(next(iter(values.values())))
         for metric, samples in values.items():
+            n = len(samples)
             row[f'{metric}_mean'] = float(np.mean(samples))
             row[f'{metric}_std'] = float(np.std(samples))
+            row[f'{metric}_ci95'] = (
+                float(
+                    stats.t.ppf(0.975, n - 1)
+                    * np.std(samples, ddof=1)
+                    / np.sqrt(n)
+                )
+                if n > 1
+                else 0.0
+            )
         out.append(row)
     return out
 
@@ -219,7 +251,9 @@ def missing_points(
     """``pair -> [points it has no row for]``, over the expected grid."""
     have = defaultdict(set)
     for row in rows:
-        have[row['pairs']].add(tuple(row[k] for k in keys))
+        # `get`: a row written before a key existed (a dimension-sweep row
+        # without a seed) reads as `None` for it.
+        have[row['pairs']].add(tuple(row.get(k) for k in keys))
     return {
         tag: [p for p in expected if p not in have[tag]]
         for tag in tags
@@ -273,6 +307,11 @@ def commands_for(cfg: DictConfig, source: str, target: str) -> list[str]:
     strategies = ','.join(str(s) for s in cfg.pilot.strategies)
     ranks = ','.join(str(r) for r in cfg.dimension.ranks)
     seeds = ','.join(str(r) for r in cfg.pilot.seeds)
+    dim_seeds = (
+        f" 'seeds=[{','.join(str(s) for s in cfg.dimension.seeds)}]'"
+        if cfg.dimension.seeds
+        else ''
+    )
     return [
         (
             f"just lambda-sweep {common} 'ranks=[{symbols}]' "
@@ -290,7 +329,7 @@ def commands_for(cfg: DictConfig, source: str, target: str) -> list[str]:
         ),
         (
             f"just dimension-sweep {common} 'ranks=[{ranks}]' "
-            f'pilots.n_pilots={n} {decoder}'
+            f'pilots.n_pilots={n} {decoder}{dim_seeds}'
         ),
     ]
 
@@ -317,6 +356,39 @@ def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
     tmp.replace(path)
+
+
+def layout(
+    cfg: DictConfig, figure: str, metrics: list[str]
+) -> tuple[str, dict[str, Any]]:
+    """Which panels one figure draws, and how: ``(suffix, plot kwargs)``.
+
+    ``cfg[figure].panels`` picks a subset of ``metrics`` (all when null);
+    a subset is named in the returned filename suffix. A figure with one
+    panel takes ``figure.text_scale_single`` and puts its legend in that
+    panel at ``legend.single``; otherwise ``figure.text_scale`` and
+    ``legend.panel`` / ``legend.loc`` apply.
+    """
+    section = cfg[figure]
+    panels = [str(m) for m in section.panels or metrics]
+    if not set(panels) <= set(metrics):
+        raise SystemExit(
+            f'{figure}.panels={panels} names metrics outside eval.metrics='
+            f'{metrics}.'
+        )
+    single = len(panels) == 1
+    return ('' if panels == metrics else '_' + '-'.join(panels)), {
+        'metrics': panels,
+        'legend': (
+            (panels[0], str(section.legend.single))
+            if single
+            else (str(section.legend.panel), str(section.legend.loc))
+        ),
+        'panel': tuple(float(v) for v in cfg.figure.panel),
+        'text_scale': float(
+            cfg.figure.text_scale_single if single else cfg.figure.text_scale
+        ),
+    }
 
 
 def print_margins(title: str, rows: list[tuple[str, float, str, float]]):
@@ -349,7 +421,18 @@ def main(cfg: DictConfig) -> None:
     ranks = [int(r) for r in cfg.dimension.ranks]
     n_pilots = int(cfg.dimension.n_pilots)
     root = cfg.output.results
+    interval = str(cfg.interval)
+    if interval not in ('ci95', 'std'):
+        raise SystemExit(f'interval={interval!r}; expected ci95 or std.')
+    spread = interval if cfg.errorbars else None
+    # The means-only figures get their own name, so both versions can sit
+    # side by side; the CSVs behind them are the same either way.
+    shape = '' if cfg.errorbars else '_nobars'
 
+    pilot_seeds = [int(s) for s in cfg.pilot.seeds]
+    dim_seeds = (
+        [int(s) for s in cfg.dimension.seeds] if cfg.dimension.seeds else None
+    )
     pilots = pilot_records(
         result_dir(root, str(cfg.pilot.study), dataset),
         tags,
@@ -357,6 +440,7 @@ def main(cfg: DictConfig) -> None:
         symbols,
         counts,
         strategies,
+        pilot_seeds,
     )
     dims = dimension_rows(
         result_dir(root, str(cfg.dimension.study), dataset),
@@ -365,9 +449,13 @@ def main(cfg: DictConfig) -> None:
         n_pilots,
         str(cfg.dimension.strategy),
         ranks,
+        dim_seeds,
     )
 
-    # --- coverage: every pair at every point, or nothing is drawn -----
+    # --- coverage: every pair at every point and seed, or nothing -----
+    # Seeds are averaged within a pair before the spread over pairs is
+    # taken, so a pair missing a seed at one point would put a different
+    # mix of realisations under that point than under its neighbours.
     pilot_keys = ('method', 'strategy', 'n_pilots')
     dim_keys = ('method', 'requested')
     pilot_methods = sorted({r['method'] for r in pilots})
@@ -376,12 +464,13 @@ def main(cfg: DictConfig) -> None:
         'pilot sweep': missing_points(
             pilots,
             tags,
-            pilot_keys,
+            (*pilot_keys, 'seed'),
             [
-                (m, s, n)
+                (m, s, n, seed)
                 for m in pilot_methods
                 for s in strategies
                 for n in counts
+                for seed in pilot_seeds
             ],
         )
         if pilots
@@ -389,8 +478,13 @@ def main(cfg: DictConfig) -> None:
         'dimension sweep': missing_points(
             dims,
             tags,
-            dim_keys,
-            [(m, k) for m in dim_methods for k in ranks],
+            (*dim_keys, 'seed'),
+            [
+                (m, k, seed)
+                for m in dim_methods
+                for k in ranks
+                for seed in (dim_seeds or [None])
+            ],
         )
         if dims
         else {tag: ['everything'] for tag in tags},
@@ -432,15 +526,6 @@ def main(cfg: DictConfig) -> None:
         average_over_pairs(pilots, pilot_keys, metrics),
         key=lambda r: (order.index(r['method']), r['strategy'], r['n_pilots']),
     )
-    natives = defaultdict(list)
-    for row in pilots:
-        if isinstance(row.get('native_accuracy'), float):
-            natives[row['pairs']].append(row['native_accuracy'])
-    reference = (
-        {'accuracy': float(np.mean([np.mean(v) for v in natives.values()]))}
-        if natives
-        else None
-    )
 
     stem = '_'.join(
         (
@@ -461,19 +546,17 @@ def main(cfg: DictConfig) -> None:
         if r['method'] not in dropped
         and (r['method'], r['strategy']) not in dropped_cells
     ]
+    only, drawn = layout(cfg, 'pilot', metrics)
     written = plot_pilot_efficiency(
         shown,
-        metrics=metrics,
         out_path=figure_dir(
             cfg.output.figures, str(cfg.output.study), dataset, base
         )
-        / stem,
-        reference=reference,
-        title=(
-            f'Semantic pilots — {dataset}, {base} chart, {symbols} symbols, '
-            f'mean ± sd over {len(pairs)} encoder pairs'
-        ),
+        / f'{stem}{shape}{only}',
         formats=tuple(cfg.output.formats),
+        spread=spread,
+        errorbars=True,
+        **drawn,
     )
 
     # --- figure (iii) --------------------------------------------------
@@ -499,21 +582,18 @@ def main(cfg: DictConfig) -> None:
         )
     )
     write_rows(results / f'{stem}.csv', dim_summary)
+    only, drawn = layout(cfg, 'dimension', metrics)
     written += plot_dimension_sweep(
         dim_summary,
-        metrics=metrics,
         out_path=figure_dir(
             cfg.output.figures, str(cfg.output.study), dataset, base
         )
-        / stem,
-        reference=reference,
+        / f'{stem}{shape}{only}',
         hue_of=OmegaConf.to_container(cfg.hue_of, resolve=True),
-        title=(
-            f'Compression — {dataset}, {base} chart, N={n_pilots} '
-            f'{cfg.dimension.strategy} pilots, mean ± sd over {len(pairs)} '
-            'encoder pairs'
-        ),
         formats=tuple(cfg.output.formats),
+        spread=spread,
+        errorbars=True,
+        **drawn,
     )
 
     # --- where the average could hide a flip --------------------------

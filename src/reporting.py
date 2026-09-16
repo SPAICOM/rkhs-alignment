@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 __all__ = [
+    'bandwidth_slug',
     'budget_slug',
     'chart_slug',
     'dimension_fits_stem',
@@ -158,6 +159,21 @@ def lam_slug(grid: Sequence[float]) -> str:
     return f'lam{_real(values[0])}to{_real(values[-1])}x{len(values)}'
 
 
+def bandwidth_slug(scales: Sequence[float]) -> str:
+    """Tag for a kernel-bandwidth axis: its span and how many points.
+
+    Named separately from the lambda grid because the two are swept
+    together: one cell of the bandwidth study is a *surface* over
+    (bandwidth, lambda), and a run that varies only the bandwidth must
+    not land on the filename of the single-bandwidth run it came from.
+    ``pilot_sweep.py`` reads the best lambda per budget out of these
+    CSVs and would otherwise pick it off whichever bandwidth happened to
+    sort first.
+    """
+    values = sorted(float(s) for s in scales)
+    return f'bw{_real(values[0])}to{_real(values[-1])}x{len(values)}'
+
+
 def budget_slug(counts: Sequence[int]) -> str:
     """Tag for a pilot-budget axis: its span and how many points."""
     values = sorted(int(c) for c in counts)
@@ -182,8 +198,14 @@ def lambda_stem(
     symbols: int | None,
     n_pilots: int,
     lam_grid: Sequence[float],
+    bandwidths: Sequence[float] | None = None,
 ) -> str:
-    """Name of one cell of the lambda sweep: one chart, one budget."""
+    """Name of one cell of the lambda sweep: one chart, one budget.
+
+    ``bandwidths`` names the second axis when the run sweeps the kernel
+    bandwidth alongside lambda. Left ``None`` the name is unchanged, so
+    the ordinary sweep keeps the filenames every earlier run wrote.
+    """
     return '_'.join(
         (
             'lambda',
@@ -194,6 +216,7 @@ def lambda_stem(
             f'n{int(n_pilots)}',
             lam_slug(lam_grid),
         )
+        + (() if bandwidths is None else (bandwidth_slug(bandwidths),))
     )
 
 
@@ -227,26 +250,30 @@ def dimension_stem(
     strategy: str,
     rates: Sequence[int],
     decoder: str,
+    seeds: Sequence[int] | None = None,
 ) -> str:
     """Name of one compression comparison: one chart, one budget.
 
     ``chart`` is the base chart the ranks expand, not one expanded rank:
     the figure spans the whole rank axis. The decoder is named because
     the accuracy panel is read off it, and a linear and an MLP head put
-    the same curves at different heights.
+    the same curves at different heights. ``seeds`` names a multi-seed
+    run, so it never overwrites the single-realisation figure; ``None``
+    leaves the name exactly as it was before seeds existed.
     """
-    return '_'.join(
-        (
-            'dims',
-            _UNSAFE.sub('-', str(dataset)),
-            pairs_slug(pairs),
-            chart_slug(chart),
-            f'n{int(n_pilots)}',
-            strategies_slug([strategy]),
-            ranks_slug(rates),
-            f'dec-{_UNSAFE.sub("-", str(decoder))}',
-        )
-    )
+    parts = [
+        'dims',
+        _UNSAFE.sub('-', str(dataset)),
+        pairs_slug(pairs),
+        chart_slug(chart),
+        f'n{int(n_pilots)}',
+        strategies_slug([strategy]),
+        ranks_slug(rates),
+        f'dec-{_UNSAFE.sub("-", str(decoder))}',
+    ]
+    if seeds:
+        parts.append(f'seeds{"-".join(str(int(x)) for x in seeds)}')
+    return '_'.join(parts)
 
 
 def dimension_fits_stem(

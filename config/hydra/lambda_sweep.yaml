@@ -16,11 +16,16 @@
 # `len(charts) * len(pilots)` CSVs, every one of them named after the
 # configuration that produced it.
 #
+# `bandwidths` is the exception: it is an axis of the *figure* rather
+# than of the grid, drawn as one curve per bandwidth on the lambda axis
+# they share, so it multiplies neither the figures nor the CSVs.
+#
 #   just lambda-sweep
 #   uv run scripts/lambda_sweep.py symbol_divisor=7
 #   uv run scripts/lambda_sweep.py 'pilots.counts=[500, 1000]'
 #   uv run scripts/lambda_sweep.py 'charts=[{preprocess: pca}]'
 #   uv run scripts/lambda_sweep.py lam.min=1e-6 lam.max=1e-1 lam.per_decade=8
+#   uv run scripts/lambda_sweep.py 'bandwidths=[0.25, 0.5, 1.0, 2.0]'
 #   uv run scripts/lambda_sweep.py data=semasia_mnist
 #
 # The CSVs it writes are the input to `pilot_sweep.py`, which reads RKA's
@@ -80,6 +85,35 @@ lam:
   min: 1.0e-10
   max: 1.0e+2
   per_decade: 2
+
+# --- the kernel bandwidth ---------------------------------------------
+# Optional second axis on the *same* figure: one curve per multiplier on
+# the median-heuristic bandwidth, against the shared lambda axis.
+#
+#   uv run scripts/lambda_sweep.py 'bandwidths=[0.25, 0.5, 1.0, 2.0]'
+#
+# `null` means the axis does not exist -- the swept method keeps the
+# `bandwidth_scale` its preset ships (1.0, the median heuristic itself)
+# and the run writes exactly the filenames it always has. A list is
+# named in the stem (`bw0p25to2x4`), so a bandwidth run can never land
+# on the CSV of the single-bandwidth run it came from. That separation
+# is not cosmetic: `pilot_sweep.py` reads the best lambda per budget out
+# of these CSVs and has no bandwidth column to filter on, so it would
+# otherwise take whichever bandwidth happened to sort first.
+#
+# The two knobs are not independent, which is the reason to sweep them
+# together rather than one at a time. `gamma = 1 / (scale * median
+# squared distance)`, so the multiplier scales the *squared* length
+# scale -- 0.25 and 4.0 are half and double the distance the kernel
+# calls "near" -- and moving it moves the Gram spectrum, which drags the
+# lambda axis under it. `lam_scaling: trace` in `alignment/rkhs.yaml`
+# divides the bulk of that out; what is left is the interaction this
+# figure is for.
+#
+# Cost is one fit per bandwidth, not one per (bandwidth, lambda): the
+# whole lambda grid shares a bandwidth's eigendecomposition, exactly as
+# it already does at a single one.
+bandwidths: null
 
 # --- calibration data -------------------------------------------------
 # The budget axis itself lives in `axes/default.yaml`, shared with
@@ -148,7 +182,21 @@ output:
   figures: figures
   results: results
   formats: [pdf, png]
-  title: null           # null -> built from the cell's configuration
+  title: null           # null -> untitled; a string is drawn on every figure
+  # Figure size in inches and a multiplier on every font. The size is one
+  # panel of the pair-average figures (`figure` in `pair_average.yaml`);
+  # the text is set smaller than theirs, since this figure stands alone:
+  # 1.25 read too large here, and 0.9 at 9 x 7 in too small.
+  panel: [6.0, 4.6]
+  text_scale: 0.9
+  # Draw the receiver's native accuracy as a dotted ceiling on the
+  # accuracy figure. It sits well above the curves, so turning it off
+  # tightens the axis; the value is printed in the run summary either way.
+  native_rx: false
+  # The grey in-plot notes: "best lambda = ..." beside the vertical rule
+  # at the best lambda, and "native RX" on its rule. Off leaves the rules
+  # to the caption.
+  annotate: false
 
 # Skip a cell whose CSV is already on disk, under `output.results` (its
 # figures are redrawn from it, which costs nothing). Nothing is ever read
