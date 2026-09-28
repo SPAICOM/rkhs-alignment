@@ -1,0 +1,119 @@
+# RKA against pure kernel alignment, per pilot design.
+#
+# Figure (ii)'s axis drawn once per pilot design. The designs are
+# `src/alignment/pilots.py` strategies, so herding and its mirror share
+# one kernel and one implementation:
+#
+#   herding       the reference, the kernel's own best case
+#   random        i.i.d. from the pool, the undesigned baseline
+#   anti_herding  herding's mirror: same greedy MMD score, minimised
+#   classes:2     pilots from two classes only: support bias aligned
+#                 with the labels the decoder reads out
+#   ball          the pilots nearest one random pool point: support bias
+#                 with no label structure
+#
+# The point is what each method falls back on when the pilots cannot
+# identify the map: RKA degrades to `Q z`, pure kernel ridge to the
+# receiver's mean. So the adversarial designs separate them where the
+# representative ones do not.
+#
+#   just pilot-designs
+#   just pilot-designs plot_only=true
+#   just pilot-designs 'designs=[herding,anti_herding]' 'seeds=[0]'
+
+defaults:
+  - data: semasia
+  # Order is hue order on the figure: Procrustes first, as everywhere.
+  - alignment@methods.procrustes: procrustes
+  - alignment@methods.rkhs: rkhs
+  - alignment@methods.krr: krr
+  - _self_
+
+seed: 0
+seeds: [0, 1, 2, 3, 4]
+
+# The five pair-average pairs, stated outright rather than resolved by
+# width: this study is about the calibration set, so the encoder pairs
+# have to be the ones every other figure averages over.
+pairs:
+  - source: regnety_016.pycls_in1k
+    target: vit_large_patch16_224.augreg_in21k_ft_in1k
+  - source: repvgg_b0.rvgg_in1k
+    target: aimv2_large_patch14_224.apple_pt
+  - source: mobilenetv3_large_100.ra_in1k
+    target: vit_base_patch16_224.augreg_in21k
+  - source: efficientvit_b0.r224_in1k
+    target: beit_base_patch16_224.in22k_ft_in22k
+  - source: ghostnet_100.in1k
+    target: eva02_base_patch14_224.mim_in22k
+
+designs: [herding, random, anti_herding, 'classes:2', ball]
+
+# One rate, one chart: the axis of this study is the design, not the
+# compression. Both spaces keep `symbols` whitened directions.
+symbols: 32
+chart:
+  preprocess: whiten
+
+pilots:
+  counts: [128, 256, 512, 1024, 2048, 4096, 8192]
+  pool_size: 50000
+
+# As in the sweeps since 2026-09-18: each device standardises from its
+# whole local split, which costs no airtime, so a biased design biases
+# the cross-map and never the whitening.
+use_local_context: true
+
+# `lambda` is not read back from a schedule here. A schedule measured on
+# herded pilots would not belong to a run whose pilots are adversarial,
+# so every cell selects it on a held-out slice of its own pilots -- what
+# a deployment gets.
+
+decoder:
+  enabled: true
+  kind: linear
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+eval:
+  metrics: [accuracy, mrr]
+  topk: [1, 5]
+
+# Records from an earlier run in the same schema, merged before drawing:
+# the exploratory script this study grew out of left 2709 cells, so the
+# figures can be redrawn without refitting. Set to null to use only what
+# this run fits.
+import_records: outputs/diagnostics/rka_vs_krr_design_budget.csv
+
+output:
+  study: pilot_designs
+  figures: figures
+  results: results
+  formats: [pdf, png]
+  panel: [6.0, 4.6]
+  text_scale: 0.9
+
+resume: true
+plot_only: true
+
+wandb:
+  project: rkhs-alignment
+  entity: null
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false

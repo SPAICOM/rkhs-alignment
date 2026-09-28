@@ -112,11 +112,27 @@ seeds: null
 # k=32, against 0.76-0.85 with standard scaling.
 charted: []
 
-# The fitted methods standardise from the pilots alone, as the lambda
-# sweep's charts do. `true` lets SVCCA estimate its SVD basis from all of
-# each device's unpaired data instead -- its intended deployment, but no
-# longer the same information the read-back methods had.
-use_local_context: false
+# --- local standardisation -------------------------------------------
+# Estimate each side's chart -- the truncated whitening or PCA of
+# `alignment.preprocess` -- from that device's whole local split rather
+# than from the pilots.
+#
+# Standardising one latent space needs no pairing, so a device can do it
+# from everything it holds; only the paired rows cost airtime. Tying the
+# chart to the pilot budget instead makes the low-budget regime look far
+# worse than it is -- on the Digits pair it is worth +14 accuracy points
+# at N=5 and +7 at N=8 -- and it changes which method wins: measured on
+# regnety_016 -> vit_large at k=32, N=48, pure kernel alignment gains
+# +2.9 pp from the local chart while RKA gains +0.3 pp, because RKA's
+# rigid stage was partly absorbing the badly conditioned pilot
+# covariance.
+#
+# On by default since 2026-09-18, in every study, so the chart means the
+# same thing everywhere. `lambda_sweep.py` honours it too, so a schedule
+# read back by another study was measured on the chart that study fits
+# on. Results produced before that date are on the pilot-fitted chart
+# and are not comparable.
+use_local_context: true
 
 # --- the consistency check ----------------------------------------------
 # A read-back curve is only comparable to a fitted one if both came from
@@ -133,10 +149,12 @@ verify:
 
 # --- receiver decoder -------------------------------------------------
 # Must be the head the lambda sweep scored with -- `verify` catches it if
-# not. See `lambda_sweep.yaml` on `mlp` against `linear`.
+# not -- and the head `pair_average.yaml` declares, since it pools these
+# rows with the pilot sweep's. See `lambda_sweep.yaml` on `linear`
+# against `mlp`.
 decoder:
   enabled: true
-  kind: mlp
+  kind: linear
   checkpoint_dir: models/decoders
   cache: true
   n_classes: 10

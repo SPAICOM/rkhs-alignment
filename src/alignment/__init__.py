@@ -75,7 +75,9 @@ from .neural import (
     ResidualMLPAligner,
 )
 from .pilots import (
+    ADVERSARIAL_DESIGNS,
     PILOT_STRATEGIES,
+    parse_design,
     scheduled_bandwidth,
     select_pilot_path,
     select_pilots,
@@ -95,6 +97,7 @@ from .relative import (
 from .rkhs import RKHSAligner
 
 __all__ = [
+    'ADVERSARIAL_DESIGNS',
     'PILOT_STRATEGIES',
     'Aligner',
     'CCAAligner',
@@ -122,6 +125,7 @@ __all__ = [
     'mean_reciprocal_rank',
     'median_squared_distance',
     'orthogonal_procrustes',
+    'parse_design',
     'parseval_frame',
     'prune_anchors',
     'reconstruction_metrics',

@@ -1,0 +1,19 @@
+# @package alignment
+# Pure kernel alignment: kernel ridge from the whitened source straight to
+# the whitened target. No rigid stage (Q = 0, so E = Y) and no
+# orthogonality constraint. Everything else is `rkhs.yaml`, inherited so
+# the kernel, the ridge and the chart match RKA's.
+#
+# Read against `rkhs` and `rkhs_free` this is the ablation of the rigid
+# stage. Its lam -> inf limit is the zero map -- the receiver's mean --
+# rather than Procrustes, so the right end of a lambda sweep falls away
+# instead of landing on the Procrustes line.
+#
+#   uv run scripts/ablation_sweep.py
+
+defaults:
+  - rkhs@_here_
+  - _self_
+
+rigid_stage: false
+orthogonal_residual: false

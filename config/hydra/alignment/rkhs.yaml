@@ -103,7 +103,14 @@ selection: nmse           # nmse | cosine
 # eigenvalue sits near s_mean and shrinkage bites at lam ~ 1/N. Read
 # `rkhs_gram_flatness` (s_max/s_mean, -> 1 is bad) and compare budgets on
 # effective degrees of freedom, not on lam.
-lam_scaling: trace        # n | trace
+# Set to `n`: the shift is N * lam, i.e. the objective is
+# (1/N)||E - G||_F^2 + lam ||g||_H^2, which is the convention the
+# experiments report. `trace` additionally divides out s_mean (see
+# above) and `plain` is textbook kernel ridge, shift `lam` itself. All
+# three are the same one-parameter path, so switching relabels the axis
+# rather than changing the model -- but results cached under one are on a
+# different axis, so re-run rather than resume across a switch.
+lam_scaling: n            # n | trace | plain
 
 # --- pipeline switches ------------------------------------------------
 # Double-centre the Gram matrix. Keep this on: the model has no intercept

@@ -38,6 +38,7 @@ __all__ = [
     'plot_kernel_study',
     'plot_method_comparison',
     'plot_pilot_efficiency',
+    'plot_regularization_ablation',
     'plot_regularization_bandwidths',
     'plot_regularization_metric',
     'plot_regularization_study',
@@ -75,6 +76,15 @@ METHOD_COLORS: dict[str, str] = {
     'residual_mlp': _PALETTE[3],
     'direct_mlp': _PINK,
     'ppfe': _GOLDEN_YELLOW,
+    # RKA's ablations: its hue, stepped darker as the model loses a part.
+    # They are one method with components removed, so they share its
+    # identity rather than borrowing a slot that names another method
+    # elsewhere; `_METHOD_STYLES` gives each its own dash and marker.
+    # Against procrustes, rkhs and each other (all pairs, OKLab dE x100,
+    # Machado CVD simulation) the worst pair is rkhs_free/krr at CVD
+    # 14.9, normal 18.3.
+    'rkhs_free': '#9a3d1a',
+    'krr': '#4f200d',
 }
 
 # A method whose hue needs a second channel to be told apart, drawn with
@@ -84,6 +94,8 @@ METHOD_COLORS: dict[str, str] = {
 # take the first style slot.
 _METHOD_STYLES: dict[str, tuple[str, str]] = {
     'ppfe': ('-.', 'D'),
+    'rkhs_free': ('--', 's'),
+    'krr': (':', '^'),
 }
 
 # Second channel: the pilot-selection strategy.
@@ -288,7 +300,13 @@ def plot_pilot_efficiency(
                     if spread is not None
                     else None
                 )
-                line, marker = styles[strategy]
+                # One design leaves the dash free, so a method that has
+                # its own dash and marker gets them back.
+                line, marker = (
+                    styles[strategy]
+                    if len(strategies) > 1
+                    else _METHOD_STYLES.get(method, styles[strategy])
+                )
                 label = (
                     f'{_label(method)} - {_label(strategy)}'
                     if len(strategies) > 1
@@ -725,6 +743,8 @@ def _label(name: str) -> str:
         'svcca': 'SVCCA',
         'kcca': 'KCCA',
         'cka': 'CKA matching',
+        'rkhs_free': 'RKA w/o orthogonality',
+        'krr': 'Pure kernel alignment',
         'pca_rkhs': 'PCA-RKA',
         'pca_procrustes': 'PCA-Procrustes',
         'pga_procrustes': 'PGA-Procrustes',
@@ -1241,6 +1261,172 @@ def plot_regularization_bandwidths(
             avoid=[line for line in ax.get_lines() if line is not rule],
             fontsize=13 * text_scale,
         )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    for ext in formats:
+        path = _with_extension(out_path, ext)
+        fig.savefig(
+            path,
+            dpi=200,
+            facecolor=_SURFACE,
+            bbox_inches='tight',
+            pad_inches=0.02,
+        )
+        written.append(path)
+    plt.close(fig)
+    return written
+
+
+def plot_regularization_ablation(
+    curves: dict[str, list[dict[str, Any]]],
+    metric: str,
+    out_path: str | Path,
+    baselines: dict[str, dict[str, float]] | None = None,
+    reference: dict[str, float] | None = None,
+    title: str | None = None,
+    labels: dict[str, str] | None = None,
+    ylim: tuple[float, float] | None = None,
+    formats: tuple[str, ...] = ('png', 'pdf'),
+    panel: tuple[float, float] = (9.0, 7.0),
+    text_scale: float = 1.0,
+    annotate: bool = True,
+) -> list[Path]:
+    """One metric against ``lambda``, one curve per variant of RKA.
+
+    The axes of :func:`plot_regularization_metric`, with RKA and its
+    ablations swept side by side against the flat baselines. The
+    variants do not share a right-hand limit: RKA and its unconstrained
+    form fall back onto Procrustes as ``lambda`` grows, while pure kernel
+    alignment has no rigid stage to fall back on and collapses to the
+    receiver's mean.
+
+    No ``+/- sd`` band and no best-``lambda`` rule: each variant has its
+    own optimum, and the spread is in the CSV.
+
+    Parameters
+    ----------
+    curves : dict[str, list[dict]]
+        ``{variant: rows}``, one row per ``lam`` with ``lam`` and
+        ``f'{metric}_mean'``, drawn in the dict's order. Every variant
+        needs a fixed hue in ``METHOD_COLORS``.
+    metric : str
+        The metric to plot.
+    out_path : str | Path
+        Destination stem; one file per entry of ``formats``.
+    baselines : dict[str, dict[str, float]], optional
+        ``{method: {metric: value}}``, drawn as horizontal lines.
+    reference : dict[str, float], optional
+        Receiver's native performance, drawn as a dotted rule.
+    title : str, optional
+        Figure title.
+    labels : dict[str, str], optional
+        Legend text per series name, overriding the default label.
+    ylim : tuple[float, float], optional
+        Clip the metric axis. Left ``None`` it spans every curve.
+    formats : tuple[str, ...], default=('png', 'pdf')
+        Extensions to write.
+    panel : tuple[float, float], default=(9.0, 7.0)
+        Width and height of the figure, in inches.
+    text_scale : float, default=1.0
+        Multiplier on every font size.
+    annotate : bool, default=True
+        Write ``native RX`` on the reference rule.
+
+    Returns
+    -------
+    list[Path]
+        The files written.
+    """
+    unknown = [name for name in curves if name not in METHOD_COLORS]
+    if unknown:
+        raise ValueError(
+            f'No fixed hue for {unknown}; add one to METHOD_COLORS.'
+        )
+    baselines = baselines or {}
+    labels = labels or {}
+    legend = lambda name: labels.get(name, _label(name))  # noqa: E731
+    line_colors = _assign_colors(list(baselines))
+
+    fig, ax = plt.subplots(figsize=panel)
+    fig.patch.set_facecolor(_SURFACE)
+    ax.set_facecolor(_SURFACE)
+
+    for name, rows in curves.items():
+        color = METHOD_COLORS[name]
+        line, marker = _METHOD_STYLES.get(name, ('-', 'o'))
+        rows = sorted(rows, key=lambda r: r['lam'])
+        ax.plot(
+            [r['lam'] for r in rows],
+            [r[f'{metric}_mean'] for r in rows],
+            line,
+            marker=marker,
+            color=color,
+            label=legend(name),
+            linewidth=2.0,
+            markersize=7,
+            markeredgecolor=_SURFACE,
+            markeredgewidth=1.0,
+        )
+
+    for name, values in baselines.items():
+        if metric in values:
+            ax.axhline(
+                values[metric],
+                linestyle='--',
+                color=line_colors[name],
+                linewidth=2.0,
+                label=legend(name),
+            )
+
+    if reference and metric in reference:
+        ax.axhline(
+            reference[metric],
+            linestyle=(0, (1, 3)),
+            color=_MUTED,
+            linewidth=1.6,
+        )
+        if annotate:
+            ax.annotate(
+                'native RX',
+                xy=(0.0, reference[metric]),
+                xycoords=('axes fraction', 'data'),
+                xytext=(4, 5),
+                textcoords='offset points',
+                ha='left',
+                color=_MUTED,
+                fontsize=13 * text_scale,
+            )
+
+    ax.set_xscale('log')
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.set_xlabel(r'RKHS regularisation $\lambda$', color=_INK)
+    ax.set_ylabel(_PRETTY.get(metric, metric), color=_INK)
+    ax.grid(True, color=_GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color(_INK)
+    ax.tick_params(colors=_INK, labelsize=14 * text_scale)
+    ax.xaxis.label.set_fontsize(16 * text_scale)
+    ax.yaxis.label.set_fontsize(16 * text_scale)
+    if title:
+        fig.suptitle(title, color=_INK, fontsize=18 * text_scale)
+    fig.tight_layout()
+    # Below the axes, not in a corner: the curves span the whole width,
+    # peak mid-axis and meet the flat line at both ends, so no corner of
+    # the panel is clear -- least of all once the axis is clipped.
+    ax.legend(
+        loc='upper center',
+        bbox_to_anchor=(0.5, -0.17),
+        ncol=2,
+        frameon=False,
+        fontsize=13 * text_scale,
+        labelcolor=_INK,
+        columnspacing=1.2,
+        handlelength=2.6,
+    )
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

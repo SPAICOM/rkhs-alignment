@@ -19,6 +19,14 @@ The interesting strategy here is ``'herding'``, the kernel-aware design
 of the RKA paper (Sec. IV): it picks the pilot set whose kernel mean
 embedding best matches the full candidate pool's, in the same RKHS the
 residual stage will later be fitted in.
+
+Three further designs -- ``'anti_herding'``, ``'ball'`` and
+``'classes:k'`` -- are *adversarial*: nobody would deploy them, and that
+is the point. A map is only identifiable from pilots that cover the
+distribution it will be used on, so a design that withholds that cover is
+what separates methods by what they fall back on. RKA falls back on the
+rigid map ``Q z`` and pure kernel ridge falls back on the receiver's mean,
+so the gap between them is a measurement rather than an anecdote.
 """
 
 from __future__ import annotations
@@ -29,16 +37,17 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..anchors import Anchor, AnchorStrategy
+from ..kernels import Kernel
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..kernels import Kernel
-
 log = logging.getLogger(__name__)
 
 __all__ = [
+    'ADVERSARIAL_DESIGNS',
     'PILOT_STRATEGIES',
+    'parse_design',
     'scheduled_bandwidth',
     'select_pilot_path',
     'select_pilots',
@@ -52,14 +61,35 @@ PILOT_STRATEGIES: tuple[str, ...] = (
     'stratified',
     'herding',
     'round_robin',
+    'anti_herding',
+    'ball',
 )
+
+# Designs whose whole purpose is to withhold cover of the pool. They are
+# not ways to spend a budget well; they are the stress test that says
+# what a method does when the calibration set cannot identify the map.
+# `classes` takes a parameter, as `classes:2`.
+ADVERSARIAL_DESIGNS: tuple[str, ...] = ('anti_herding', 'ball', 'classes')
+
+# How much of the pool the 'ball' design draws its blob from: the pilots
+# are the points nearest one random pool point, so the budget itself sets
+# the radius until it would exceed this share.
+_BALL_SHARE = 0.15
+
+# Chunk of the pool scored at once when evaluating the pool's mean
+# embedding, as in `Anchor._fit_herding`.
+_HERDING_CHUNK = 512
 
 # Strategies whose answer for budget k is the k-point prefix of their
 # answer for any larger budget, so a sweep can select once and slice.
 # 'fps' and 'herding' are greedy; 'round_robin' builds one ordering of the
 # whole pool from the seed alone and truncates it.
+#
+# The adversarial designs are nested too: anti-herding is greedy like
+# herding, and 'ball' and 'classes:k' rank the pool once from the seed
+# and truncate.
 _GREEDY_STRATEGIES: frozenset[str] = frozenset(
-    {'fps', 'herding', 'round_robin'}
+    {'fps', 'herding', 'round_robin', 'anti_herding', 'ball', 'classes'}
 )
 
 
@@ -105,6 +135,132 @@ def scheduled_bandwidth(
     return float(base * (n_pilots / n_pool) ** power)
 
 
+def parse_design(strategy: str) -> tuple[str, int | None]:
+    """Split ``'classes:2'`` into its name and parameter.
+
+    Only ``'classes'`` takes one, and it is required there: how many of
+    the receiver's classes the pilots are allowed to come from is the
+    whole severity of that design, so defaulting it would hide the knob
+    the study is sweeping.
+    """
+    name, _, argument = str(strategy).partition(':')
+    if name != 'classes':
+        if argument:
+            raise ValueError(
+                f'Pilot strategy {strategy!r} takes no parameter.'
+            )
+        return name, None
+    if not argument.isdigit() or int(argument) < 1:
+        raise ValueError(
+            f'Design {strategy!r} needs a positive class count, as '
+            "'classes:2'."
+        )
+    return name, int(argument)
+
+
+def _anti_herding_order(
+    X: np.ndarray, n_pilots: int, kernel: Kernel | None, seed: int
+) -> np.ndarray:
+    """Kernel herding's exact mirror: ``argmin`` of the same score.
+
+    Herding takes ``argmax_i mu_i - (1/t) sum_{p in P_t} k(x_i, x_p)``,
+    which keeps the set both central and spread out. Minimising the same
+    score instead takes the points the pool's mean embedding reaches
+    least, and then prefers points *close* to what is already selected --
+    so the set collapses into a corner of the support and its MMD to the
+    pool grows. Same kernel, same bookkeeping, opposite sign: that is
+    what makes it the principled adversary for a method fitted in this
+    RKHS rather than merely a bad draw.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    n = X.shape[0]
+    kernel = (Kernel('rbf') if kernel is None else kernel).fit(X, seed=seed)
+
+    mu = np.empty(n)
+    for start in range(0, n, _HERDING_CHUNK):
+        stop = min(start + _HERDING_CHUNK, n)
+        mu[start:stop] = kernel(X[start:stop], X).mean(axis=1)
+
+    order = np.empty(n_pilots, dtype=int)
+    affinity = np.zeros(n)
+    available = np.ones(n, dtype=bool)
+    for t in range(n_pilots):
+        score = mu if t == 0 else mu - affinity / t
+        pick = int(np.argmin(np.where(available, score, np.inf)))
+        order[t] = pick
+        available[pick] = False
+        affinity += kernel(X[pick][None, :], X).ravel()
+    return order
+
+
+def _ball_order(X: np.ndarray, n_pilots: int, seed: int) -> np.ndarray:
+    """The points nearest one random pool point: a tight blob.
+
+    Support bias with no label structure, which is what separates it from
+    ``'classes:k'``: the pilots are unrepresentative in geometry while
+    the classes stay mixed, so a method cannot recover by having seen
+    every label.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    centre = X[rng.integers(X.shape[0])]
+    distance = np.linalg.norm(X - centre, axis=1)
+    reach = max(n_pilots, int(_BALL_SHARE * X.shape[0]))
+    return np.argsort(distance)[:reach][:n_pilots]
+
+
+def _classes_order(
+    labels: np.ndarray | None, n_pilots: int, n_classes: int, seed: int
+) -> np.ndarray:
+    """Pilots drawn from only ``n_classes`` of the receiver's classes.
+
+    Support bias aligned with the label structure the decoder reads out,
+    so the transported latents of the unseen classes land wherever the
+    map extrapolates them.
+    """
+    if labels is None:
+        raise ValueError("Design 'classes:k' requires per-sample labels.")
+    labels = np.asarray(labels)
+    rng = np.random.default_rng(seed)
+    present = np.unique(labels)
+    if n_classes > present.size:
+        raise ValueError(
+            f'classes:{n_classes} asks for more classes than the pool has '
+            f'({present.size}).'
+        )
+    keep = rng.choice(present, size=n_classes, replace=False)
+    candidates = np.flatnonzero(np.isin(labels, keep))
+    if candidates.size < n_pilots:
+        log.warning(
+            'classes:%d leaves %d candidates, short of the %d pilots asked '
+            'for; the design returns what it has.',
+            n_classes,
+            candidates.size,
+            n_pilots,
+        )
+        return rng.permutation(candidates)
+    return rng.permutation(candidates)[:n_pilots]
+
+
+def _design_order(
+    X: np.ndarray,
+    n_pilots: int,
+    strategy: str,
+    labels: np.ndarray | None,
+    kernel: Kernel | None,
+    seed: int,
+) -> np.ndarray | None:
+    """Selection order of an adversarial design, or ``None`` for the rest."""
+    name, parameter = parse_design(strategy)
+    if name not in ADVERSARIAL_DESIGNS:
+        return None
+    if name == 'anti_herding':
+        return _anti_herding_order(X, n_pilots, kernel, seed)
+    if name == 'ball':
+        return _ball_order(X, n_pilots, seed)
+    return _classes_order(labels, n_pilots, int(parameter), seed)
+
+
 def select_pilots(
     X: np.ndarray,
     n_pilots: int,
@@ -145,10 +301,11 @@ def select_pilots(
     n_pool = X.shape[0]
     if n_pilots <= 0:
         raise ValueError(f'n_pilots must be positive, got {n_pilots}.')
-    if strategy not in PILOT_STRATEGIES:
+    name, _ = parse_design(strategy)
+    if name not in (*PILOT_STRATEGIES, *ADVERSARIAL_DESIGNS):
         raise ValueError(
             f'Unknown pilot strategy {strategy!r}. '
-            f'Supported: {", ".join(PILOT_STRATEGIES)}.'
+            f'Supported: {", ".join(PILOT_STRATEGIES)}, classes:<k>.'
         )
     if n_pilots >= n_pool:
         log.debug(
@@ -157,6 +314,10 @@ def select_pilots(
             n_pool,
         )
         return np.arange(n_pool)
+
+    order = _design_order(X, n_pilots, strategy, labels, kernel, seed)
+    if order is not None:
+        return np.sort(order)
 
     fit_kwargs: dict = {'n_anchors': n_pilots}
     if strategy == 'kmeans':
@@ -219,8 +380,9 @@ def select_pilot_path(
     if not budgets:
         return {}
     largest = budgets[-1]
+    name, _ = parse_design(strategy)
 
-    if strategy not in _GREEDY_STRATEGIES or len(budgets) == 1:
+    if name not in _GREEDY_STRATEGIES or len(budgets) == 1:
         return {
             n: select_pilots(
                 X,
@@ -239,6 +401,10 @@ def select_pilot_path(
             n: everything[:n] if n < everything.size else everything
             for n in budgets
         }
+
+    order = _design_order(X, largest, strategy, labels, kernel, seed)
+    if order is not None:
+        return {n: np.sort(order[:n]) for n in budgets}
 
     fit_kwargs: dict = {'n_anchors': largest}
     if strategy == 'herding':

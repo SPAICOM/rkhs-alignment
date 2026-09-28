@@ -16,6 +16,11 @@ Without that constraint a plain kernel ridge regression of the residual
 would quietly re-absorb linear structure that belongs to ``Q``, and the
 split between "rigid" and "residual" would stop meaning anything.
 
+Both halves can be switched off, which is what the ablation study reads:
+``orthogonal_residual=False`` keeps ``Q`` and fits plain kernel ridge on
+its residual, and ``rigid_stage=False`` also drops ``Q``, so ``E = Z_tgt``
+and the whole map is kernel ridge from source to target.
+
 Pipeline (rows are samples here; ``idea.md`` stacks them as columns, so
 every expression below is the transpose of the one written there):
 
@@ -106,7 +111,7 @@ class _ResidualSolver:
         orthogonal: bool,
         lam_scaling: str = 'n',
     ) -> None:
-        if lam_scaling not in ('n', 'trace'):
+        if lam_scaling not in ('n', 'trace', 'plain'):
             raise ValueError(f'Unknown lam_scaling {lam_scaling!r}.')
         self.n, self.d_src = X.shape
         self.X = X
@@ -219,7 +224,16 @@ class _ResidualSolver:
         # `bandwidth_scale`: the mean eigenvalue moves 16x from scale 0.25
         # to 16, dragging the lambda axis under any joint sweep.
         self.s_mean_ = float(self.s.sum()) / max(self.gram_rank_, 1)
-        self.lam_scale_ = self.s_mean_ if lam_scaling == 'trace' else 1.0
+        # The shift added to the Gram eigenvalues is `n * lam * lam_scale_`,
+        # so the scale is what turns `lam` into each convention:
+        #   'n'     -> N lam          (the pipeline's own statement)
+        #   'trace' -> N lam s_mean   (dimensionless lam)
+        #   'plain' -> lam            (textbook kernel ridge, (K + lam I))
+        self.lam_scale_ = {
+            'trace': self.s_mean_,
+            'plain': 1.0 / self.n,
+            'n': 1.0,
+        }[lam_scaling]
 
         # s_max / s_mean: how peaked the spectrum is, and the diagnostic
         # that says whether `lam` has anything to select. It falls towards
@@ -256,9 +270,9 @@ class _ResidualSolver:
         ----------
         lam : float
             Ridge strength. The effective shift is
-            ``N * lam * lam_scale_``, matching ``H = K (K + N lam I)^-1``
-            under ``lam_scaling='n'`` and the same expression on a Gram
-            matrix normalised to unit mean eigenvalue under ``'trace'``.
+            ``N * lam * lam_scale_``: ``N lam`` under ``lam_scaling='n'``,
+            the same on a Gram matrix normalised to unit mean eigenvalue
+            under ``'trace'``, and ``lam`` itself under ``'plain'``.
 
         Returns
         -------
@@ -346,16 +360,19 @@ class RKHSAligner(Aligner):
         Held-out fraction used for that selection.
     selection : {'nmse', 'cosine'}, default='nmse'
         Criterion optimised over ``lam_grid``.
-    lam_scaling : {'n', 'trace'}, default='n'
+    lam_scaling : {'n', 'trace', 'plain'}, default='n'
         Units of ``lam``. ``'n'`` is the pipeline's literal convention,
         shift ``N * lam``. ``'trace'`` additionally divides out the mean
         non-zero eigenvalue of the centred Gram matrix, so the penalty
         becomes ``lam * s_mean * ||g||_H^2`` -- i.e. ``lam`` is
         dimensionless and one grid means the same thing across kernel
-        families and bandwidths, which it does not under ``'n'``. It is a
-        reparametrisation of the same one-parameter path, not a different
-        model: no fit becomes reachable or unreachable, the labels on the
-        axis change.
+        families and bandwidths, which it does not under ``'n'``.
+        ``'plain'`` is textbook kernel ridge, shift ``lam``, i.e.
+        ``A = (K_c + lam I)^-1 M``; the objective it minimises is
+        ``||M - G||_F^2 + lam ||g||_H^2`` with no ``1/N`` in front of the
+        loss. All three are reparametrisations of the same one-parameter
+        path, not different models: no fit becomes reachable or
+        unreachable, only the labels on the axis change.
     center_kernel : bool, default=True
         Double-centre the Gram matrix (strongly recommended: the model
         has no explicit intercept in feature space).
@@ -363,6 +380,15 @@ class RKHSAligner(Aligner):
         Enforce ``G X^T = 0``. Setting it to ``False`` degrades the
         method to plain kernel ridge on the Procrustes residual, which is
         the natural ablation for the identifiability constraint.
+    rigid_stage : bool, default=True
+        Fit the Procrustes map ``Q`` and model its residual. ``False``
+        drops it: ``Q = 0``, ``E = Z_tgt``, and the method is plain
+        kernel ridge from the whitened source to the whitened target --
+        the ablation for the rigid stage. Its ``lam -> inf`` limit is
+        then the zero map, not Procrustes. Requires
+        ``orthogonal_residual=False``: the constraint hands the linear
+        functions of the source to ``Q``, and with no ``Q`` it would
+        remove them from the map altogether.
     ridge_B : float, default=1e-8
         Relative ridge added to ``B = X^T H X`` before solving; needed
         when ``N`` is small relative to ``d_src``.
@@ -392,6 +418,7 @@ class RKHSAligner(Aligner):
         lam_scaling: str = 'n',
         center_kernel: bool = True,
         orthogonal_residual: bool = True,
+        rigid_stage: bool = True,
         ridge_B: float = 1e-8,
         max_points: int | None = None,
         preprocess: str = 'whiten',
@@ -409,10 +436,17 @@ class RKHSAligner(Aligner):
         )
         if selection not in ('nmse', 'cosine'):
             raise ValueError(f'Unknown selection criterion {selection!r}.')
-        if lam_scaling not in ('n', 'trace'):
+        if lam_scaling not in ('n', 'trace', 'plain'):
             raise ValueError(
-                f'Unknown lam_scaling {lam_scaling!r}; expected "n" or '
-                '"trace".'
+                f'Unknown lam_scaling {lam_scaling!r}; expected "n", '
+                '"trace" or "plain".'
+            )
+        if not rigid_stage and orthogonal_residual:
+            raise ValueError(
+                'rigid_stage=False needs orthogonal_residual=False: the '
+                'constraint G X^T = 0 removes the linear functions of the '
+                'source so that Q can own them, and without Q the map '
+                'would have no linear part at all.'
             )
 
         self.kernel_spec = Kernel(
@@ -431,6 +465,7 @@ class RKHSAligner(Aligner):
         self.lam_scaling = lam_scaling
         self.center_kernel = bool(center_kernel)
         self.orthogonal_residual = bool(orthogonal_residual)
+        self.rigid_stage = bool(rigid_stage)
         self.ridge_B = float(ridge_B)
         self.max_points = None if max_points is None else int(max_points)
 
@@ -451,6 +486,7 @@ class RKHSAligner(Aligner):
             lam_scaling=self.lam_scaling,
             center_kernel=self.center_kernel,
             orthogonal_residual=self.orthogonal_residual,
+            rigid_stage=self.rigid_stage,
             ridge_B=self.ridge_B,
             max_points=self.max_points,
         )
@@ -458,8 +494,13 @@ class RKHSAligner(Aligner):
 
     @property
     def Q(self) -> np.ndarray:
-        """The fitted semi-orthogonal map, shape ``(d_tgt, d_src)``."""
+        """The fitted semi-orthogonal map, shape ``(d_tgt, d_src)``.
+
+        All zeros under ``rigid_stage=False``.
+        """
         self._check_fitted()
+        if self.procrustes_ is None:
+            return np.zeros((self.A_.shape[1], self._X_kernel.shape[1]))
         return self.procrustes_.Q
 
     # ------------------------------------------------------------------
@@ -473,8 +514,11 @@ class RKHSAligner(Aligner):
         labels: np.ndarray | None = None,
     ) -> None:
         # --- Steps 1-2: rigid map and its residual -------------------
-        self.procrustes_ = orthogonal_procrustes(Z_src, Z_tgt)
-        E_full = Z_tgt - self.procrustes_.apply(Z_src)
+        # Without the rigid stage the residual is the whole target.
+        self.procrustes_ = (
+            orthogonal_procrustes(Z_src, Z_tgt) if self.rigid_stage else None
+        )
+        E_full = Z_tgt - _apply_rigid(self.procrustes_, Z_src, Z_tgt.shape[1])
 
         # --- Optional sub-sampling of the O(N^3) kernel stage --------
         rng = np.random.default_rng(self.seed)
@@ -543,9 +587,13 @@ class RKHSAligner(Aligner):
 
         # The residual to model is the one this sub-fit's own Q leaves
         # behind, so the selection never sees the validation targets.
-        q = orthogonal_procrustes(X[fit_idx], Y[fit_idx])
-        E_fit = Y[fit_idx] - q.apply(X[fit_idx])
-        E_val = Y[val_idx] - q.apply(X[val_idx])
+        q = (
+            orthogonal_procrustes(X[fit_idx], Y[fit_idx])
+            if self.rigid_stage
+            else None
+        )
+        E_fit = Y[fit_idx] - _apply_rigid(q, X[fit_idx], Y.shape[1])
+        E_val = Y[val_idx] - _apply_rigid(q, X[val_idx], Y.shape[1])
 
         solver = _ResidualSolver(
             X[fit_idx],
@@ -626,7 +674,9 @@ class RKHSAligner(Aligner):
             # rank(K) - rank(X): the residual's degrees of freedom. Zero
             # or less means RKA is exactly Procrustes.
             'rkhs_capacity': self._solver.capacity_,
-            'procrustes_regime': self.procrustes_.regime,
+            'procrustes_regime': (
+                'none' if self.procrustes_ is None else self.procrustes_.regime
+            ),
             # Share of the target that the rigid stage left on the table.
             'rkhs_residual_share': float(
                 np.linalg.norm(E) / max(np.linalg.norm(Z_tgt), 1e-12)
@@ -703,10 +753,11 @@ class RKHSAligner(Aligner):
         a purely linear method holds only the first term.
         """
         self._check_fitted()
-        return self.procrustes_.Q.size + self._X_kernel.size + self.A_.size
+        rigid = 0 if self.procrustes_ is None else self.procrustes_.Q.size
+        return rigid + self._X_kernel.size + self.A_.size
 
     def _transform(self, Z_src: np.ndarray) -> np.ndarray:
-        linear = self.procrustes_.apply(Z_src)
+        linear = _apply_rigid(self.procrustes_, Z_src, self.A_.shape[1])
         k = self._solver.center_cross(self.kernel_spec(Z_src, self._X_kernel))
         return linear + k @ self.A_
 
@@ -715,12 +766,24 @@ class RKHSAligner(Aligner):
 
         This is the ``lam -> inf`` limit of the method and the pure
         Procrustes baseline, useful both as a reference and as the unit
-        test of the implementation.
+        test of the implementation. Under ``rigid_stage=False`` it is the
+        zero map, i.e. the receiver's mean.
         """
         self._check_fitted()
         X_src = np.asarray(X_src, dtype=np.float64)
         Z = self.scaler_src_.transform(X_src)
-        return self.scaler_tgt_.inverse_transform(self.procrustes_.apply(Z))
+        return self.scaler_tgt_.inverse_transform(
+            _apply_rigid(self.procrustes_, Z, self.A_.shape[1])
+        )
+
+
+def _apply_rigid(
+    fit: ProcrustesFit | None, Z_src: np.ndarray, d_tgt: int
+) -> np.ndarray:
+    """``Q z`` for every row, or zeros when the rigid stage is dropped."""
+    if fit is None:
+        return np.zeros((Z_src.shape[0], d_tgt))
+    return fit.apply(Z_src)
 
 
 # ---------------------------------------------------------------------

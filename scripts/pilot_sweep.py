@@ -27,8 +27,10 @@ means ``lambda_sweep.py`` has to have run first on the same axes -- which
 is what ``config/hydra/axes/default.yaml`` exists to guarantee.
 
 Because the schedule is imported, the fit has to match the run it was
-measured in: ``lambda_sweep.py`` fits the chart on the pilots alone, so
-``use_local_context`` defaults to false here.
+measured in. Both sweeps therefore honour ``use_local_context``, which is
+on by default: each device estimates its chart from its whole local
+split, and the lambda measured by ``lambda_sweep.py`` belongs to the same
+chart this run fits on.
 
 Every seed writes its own records CSV as it finishes and ``resume=true``
 skips the ones already on disk, so a run that dies costs one seed rather
@@ -114,19 +116,29 @@ def lambda_schedule(
     chart_tag: str,
     symbols: int | None,
     metric: str,
+    method: str | None = None,
+    bandwidth: float | None = None,
+    pattern: str = 'lambda_*.csv',
 ) -> dict[int, float]:
     """Budget -> the ``lambda`` that maximised ``metric`` in the sweep.
 
-    Reads every cell CSV ``lambda_sweep.py`` left for this dataset and
-    keeps the rows describing *this* run: same encoder pairs, same
+    Reads every cell CSV a lambda sweep left for this dataset and keeps
+    the rows describing *this* run: same encoder pairs, same
     preprocessing chart, same rate. Nothing is refitted -- the sweep
     already paid for these numbers.
+
+    Two more filters apply only to CSVs that carry the column. ``method``
+    matches the ``method`` column the ablation sweep writes, so each
+    variant reads its own lambda. ``bandwidth`` matches
+    ``bandwidth_scale``: a bandwidth sweep's CSV holds curves at every
+    scale, and the best lambda there may belong to a bandwidth the fit
+    applying it will never use.
     """
     key = f'{metric}_mean'
     best: dict[int, tuple[float, float]] = {}
     scanned = 0
 
-    for path in sorted(directory.glob('lambda_*.csv')):
+    for path in sorted(directory.glob(pattern)):
         with path.open() as handle:
             rows = list(csv.DictReader(handle))
         if not rows or key not in rows[0]:
@@ -135,10 +147,17 @@ def lambda_schedule(
         scanned += 1
         for row in rows:
             rank = int(row['symbols']) if row.get('symbols') else None
+            scale = row.get('bandwidth_scale')
             if (
                 row.get('pairs') != pairs_tag
                 or row.get('chart') != chart_tag
                 or rank != symbols
+                or (method is not None and row.get('method', method) != method)
+                or (
+                    bandwidth is not None
+                    and scale not in (None, '')
+                    and float(scale) != bandwidth
+                )
             ):
                 continue
             n_pilots = int(row['n_pilots'])
@@ -148,15 +167,61 @@ def lambda_schedule(
 
     log.info(
         'Scanned %d lambda-sweep CSVs under %s; %d budgets match '
-        'pairs=%s chart=%s %s.',
+        'pairs=%s chart=%s %s%s.',
         scanned,
         directory,
         len(best),
         pairs_tag,
         chart_tag,
         rate_slug(symbols),
+        '' if method is None else f' method={method}',
     )
     return {n: lam for n, (_, lam) in best.items()}
+
+
+def lambda_schedules(
+    cfg: DictConfig,
+    directory: Path,
+    pairs_tag: str,
+    chart_tag: str,
+    symbols: int | None,
+) -> dict[str, dict[int, float]]:
+    """One schedule per method in ``lam_schedule.methods``.
+
+    Each method reads the rows at its own ``bandwidth_scale``, and its own
+    ``method`` rows where the CSVs name one. Stops the run when a method
+    has nothing measured, since fitting it unscheduled would quietly fall
+    back on its held-out selection.
+    """
+    schedules: dict[str, dict[int, float]] = {}
+    for name in cfg.lam_schedule.methods or ():
+        name = str(name)
+        scale = cfg.methods[name].get('bandwidth_scale')
+        schedule = lambda_schedule(
+            directory,
+            pairs_tag,
+            chart_tag,
+            symbols,
+            str(cfg.lam_schedule.metric),
+            method=name,
+            bandwidth=None if scale is None else float(scale),
+            pattern=str(cfg.lam_schedule.get('pattern') or 'lambda_*.csv'),
+        )
+        if not schedule:
+            raise SystemExit(
+                f'No lambda measured for {name} under {directory}/ for '
+                f'chart={chart_tag} at {rate_slug(symbols)}. Run its lambda '
+                'sweep first, or set lam_schedule.enabled=false.'
+            )
+        log.info(
+            'Lambda schedule for %s (%s), %d budgets: %s',
+            name,
+            cfg.lam_schedule.metric,
+            len(schedule),
+            ', '.join(f'{n}:{lam:.4g}' for n, lam in sorted(schedule.items())),
+        )
+        schedules[name] = schedule
+    return schedules
 
 
 def lookup_lambda(
@@ -252,7 +317,7 @@ def run_seed(
     chart: DictConfig,
     symbols: int,
     counts: list[int],
-    schedule: dict[int, float],
+    schedules: dict[str, dict[int, float]],
     seed: int,
     context: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -260,10 +325,10 @@ def run_seed(
 
     Pilot selection sits outside the method loop, so at a given budget
     every method is fitted on exactly the same samples -- which is what
-    makes them comparable at all.
+    makes them comparable at all. ``schedules`` maps a method to its
+    lambda per budget; a method without one keeps its preset.
     """
     metrics = list(cfg.eval.metrics)
-    scheduled = set(cfg.lam_schedule.methods or ())
     configured = {
         name: configure_method(method_cfg, chart, symbols)
         for name, method_cfg in cfg.methods.items()
@@ -295,15 +360,16 @@ def run_seed(
 
             for n_pilots in counts:
                 pilots = pool[paths[n_pilots]]
-                lam = (
-                    lookup_lambda(
-                        schedule, n_pilots, bool(cfg.lam_schedule.nearest)
-                    )
-                    if schedule
-                    else None
-                )
                 for name, method_cfg in configured.items():
-                    applied = lam if name in scheduled else None
+                    applied = (
+                        lookup_lambda(
+                            schedules[name],
+                            n_pilots,
+                            bool(cfg.lam_schedule.nearest),
+                        )
+                        if schedules.get(name)
+                        else None
+                    )
                     scores = evaluate(
                         cfg,
                         pinned(method_cfg, applied),
@@ -639,29 +705,10 @@ def main(cfg: DictConfig) -> None:
             tag = chart_slug(chart)
             stem = pilot_stem(dataset, pairs, chart, rank, budgets, strategies)
 
-            schedule: dict[int, float] = {}
+            schedules: dict[str, dict[int, float]] = {}
             if cfg.lam_schedule.enabled and not cfg.plot_only:
-                schedule = lambda_schedule(
-                    lam_results,
-                    pairs_slug(pairs),
-                    tag,
-                    rank,
-                    str(cfg.lam_schedule.metric),
-                )
-                if not schedule:
-                    raise SystemExit(
-                        f'No lambda measured under {lam_results}/ for '
-                        f'chart={tag} at {rate_slug(rank)}. Run '
-                        '`just lambda-sweep` first, or set '
-                        'lam_schedule.enabled=false.'
-                    )
-                log.info(
-                    'Lambda schedule (%s), %d budgets: %s',
-                    cfg.lam_schedule.metric,
-                    len(schedule),
-                    ', '.join(
-                        f'{n}:{lam:.4g}' for n, lam in sorted(schedule.items())
-                    ),
+                schedules = lambda_schedules(
+                    cfg, lam_results, pairs_slug(pairs), tag, rank
                 )
 
             context = {
@@ -705,7 +752,7 @@ def main(cfg: DictConfig) -> None:
                         chart,
                         symbols,
                         budgets,
-                        schedule,
+                        schedules,
                         seed,
                         context,
                     ),

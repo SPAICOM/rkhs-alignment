@@ -1,0 +1,79 @@
+# Ablation of RKA over the RKHS regularisation.
+#
+# RKA is f(z) = Q z + g(z): a rigid Procrustes map, then a kernel-ridge
+# correction constrained by G X^T = 0. This study removes those parts one
+# at a time and sweeps each variant over lambda exactly as figure (i)
+# sweeps RKA:
+#
+#   rkhs       -- RKA itself, the reference curve
+#   rkhs_free  -- Procrustes + kernel ridge, no orthogonality constraint
+#   krr        -- pure kernel alignment: no Procrustes (E = Y), no
+#                 constraint
+#
+# Everything else is `lambda_sweep.yaml` -- the lambda grid, the pilot
+# design, the decoder, the evaluation -- so a variant's curve is
+# comparable point for point with the figure (i) cell it came from. Only
+# the cell below is pinned. It is the bandwidth run of figure (i) on
+# regnety_016 -> vit_large_p16 at k=32, N=8192, with the linear head.
+#
+#   just kernel-ablation-sweep
+#   just kernel-ablation-sweep compare_bandwidth=1.0
+#   just kernel-ablation-sweep plot_only=true
+#   uv run scripts/kernel_ablation_sweep.py 'variants=[rkhs,krr]'
+#
+# Outputs land under `ablation/` rather than `lambda_sweep/`, so the
+# CSVs are never globbed by `pilot_sweep.py` or `dimension_sweep.py`.
+
+defaults:
+  - lambda_sweep
+  - alignment@methods.rkhs_free: rkhs_free
+  - alignment@methods.krr: krr
+  - _self_
+
+# The swept methods, each a key of `methods`, in the order the ablation
+# strips the model down. Every other entry of `methods` is a flat line.
+variants: [rkhs, rkhs_free, krr]
+
+# --- the cell ---------------------------------------------------------
+data:
+  models:
+    - regnety_016.pycls_in1k
+    - vit_large_patch16_224.augreg_in21k_ft_in1k
+
+charts:
+  - preprocess: whiten
+ranks: [32]
+
+pilots:
+  counts: [8192]
+
+# Each variant is fitted once per bandwidth and re-solved over the whole
+# lambda grid, as in figure (i). The variants do not have to agree on a
+# bandwidth: dropping the rigid stage hands the kernel the whole target
+# rather than a residual, which may well want a different length scale.
+bandwidths: [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
+
+# The bandwidth each variant is drawn at on the comparison figure.
+# `null` takes each variant at its own best bandwidth for that metric,
+# read off the whole (bandwidth, lambda) surface on the test split -- the
+# same oracle reading figure (i) marks with its rule, so no variant is
+# handicapped by a length scale tuned for another. A number draws every
+# variant at that one scale instead, which must be on `bandwidths`.
+compare_bandwidth: null
+
+decoder:
+  kind: linear
+
+output:
+  study: kernel_ablation
+  # Pure kernel ridge collapses to the receiver's mean as lambda grows,
+  # which is chance accuracy -- far below every other curve. `null` draws
+  # the whole range; a [low, high] pair clips that metric's axis so the
+  # gap between RKA and its unconstrained variant stays readable. A
+  # clipped figure is named after its range (`_y0p8to0p9`), so it sits
+  # beside the full-range one rather than replacing it:
+  #
+  #   just kernel-ablation-sweep plot_only=true output.ylim.accuracy=[0.8,0.9]
+  ylim:
+    accuracy: null
+    mrr: null

@@ -130,6 +130,96 @@ dimension-sweep *ARGS:
     echo "!! gave up after 6 attempts; the last exit code was $code."
     exit $code
 
+# Ablation of RKA over the RKHS regularisation: RKA, RKA without the
+# orthogonality constraint, and pure kernel alignment (no Procrustes),
+# each swept over lambda on the same pilots. The cell it runs is pinned
+# in `config/hydra/kernel_ablation_sweep.yaml`.
+#
+#   just kernel-ablation-sweep
+#   just kernel-ablation-sweep compare_bandwidth=1.0
+#   just kernel-ablation-sweep plot_only=true
+[doc('Ablation: RKA vs RKA without orthogonality vs pure kernel alignment')]
+kernel-ablation-sweep *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for attempt in 1 2 3 4 5 6; do
+        uv run scripts/kernel_ablation_sweep.py {{ARGS}} && exit 0
+        code=$?
+        # See `lambda-sweep`: retry the crash, not the usage error.
+        if [ "$code" -lt 128 ]; then
+            echo "!! exited $code -- not a crash, so not retried."
+            exit $code
+        fi
+        echo "!! attempt $attempt died on signal $((code - 128)) -- the"
+        echo "   variants that finished are on disk; retrying, resume=true"
+        echo "   skips them."
+    done
+    echo "!! gave up after 6 attempts; the last exit code was $code."
+    exit $code
+
+# Ablation of RKA over the pilot budget: RKA and Procrustes read back from
+# figure (ii), the two ablations fitted on the same pilots. Needs figure
+# (ii) and the ablations' lambda sweeps at the same budgets; the config
+# `config/hydra/kernel_ablation_pilot_sweep.yaml` gives the command for those.
+#
+#   just kernel-ablation-pilot-sweep
+#   just kernel-ablation-pilot-sweep plot_only=true
+[doc('Ablation: RKA vs its ablations over the pilot budget')]
+kernel-ablation-pilot-sweep *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for attempt in 1 2 3 4 5 6; do
+        uv run scripts/kernel_ablation_pilot_sweep.py {{ARGS}} && exit 0
+        code=$?
+        # See `lambda-sweep`: retry the crash, not the usage error.
+        if [ "$code" -lt 128 ]; then
+            echo "!! exited $code -- not a crash, so not retried."
+            exit $code
+        fi
+        echo "!! attempt $attempt died on signal $((code - 128)) -- the"
+        echo "   seeds that finished are on disk; retrying, resume=true"
+        echo "   skips them."
+    done
+    echo "!! gave up after 6 attempts; the last exit code was $code."
+    exit $code
+
+# RKA against pure kernel alignment per pilot design, including the
+# adversarial ones (anti-herding, class-biased, ball). Draws from the
+# records already on disk by default; `plot_only=false` refits.
+#
+#   just pilot-designs
+#   just pilot-designs plot_only=false 'designs=[anti_herding]' 'seeds=[0]'
+[doc('RKA vs pure kernel alignment across pilot designs')]
+pilot-designs *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for attempt in 1 2 3; do
+        uv run scripts/pilot_designs.py {{ARGS}} && exit 0
+        code=$?
+        # See `lambda-sweep`: retry the crash, not the usage error.
+        if [ "$code" -lt 128 ]; then
+            echo "!! exited $code -- not a crash, so not retried."
+            exit $code
+        fi
+        echo "!! attempt $attempt died on signal $((code - 128)) -- the"
+        echo "   seeds that finished are on disk; retrying, resume=true"
+        echo "   skips them."
+    done
+    echo "!! gave up after 3 attempts; the last exit code was $code."
+    exit $code
+
+# The diagnostics behind the kernel ablation: why the unconstrained
+# kernel wins a probe, why whitening does not prevent it, whether the
+# two-stage solve is optimal, and which encoder pairs favour RKA. Each
+# prints a table and writes nothing.
+#
+#   just kernel-diagnostics
+#   just kernel-diagnostics study=whitening
+#   just kernel-diagnostics study=screen screen.n_extremes=3
+[doc('Diagnostics behind the kernel ablation (mechanism, whitening, stationarity, screen)')]
+kernel-diagnostics *ARGS:
+    uv run scripts/kernel_diagnostics.py {{ARGS}}
+
 # Figures (ii) and (iii) averaged over encoder pairs instead of seeds.
 # Fits nothing: it pools what `pilot-sweep` and `dimension-sweep` wrote
 # for every pair listed in `config/hydra/pair_average.yaml`, and for a

@@ -1,0 +1,17 @@
+# @package alignment
+# RKA without the orthogonality constraint: Procrustes, then plain kernel
+# ridge on its residual. Everything else is `rkhs.yaml`, inherited so the
+# two cannot drift apart on the kernel, the ridge or the chart.
+#
+# Read against `rkhs` this is the ablation of the constraint G X^T = 0.
+# With it off the correction is free to re-absorb linear structure that
+# belongs to Q, so the split between rigid and residual stops meaning
+# anything. Its lam -> inf limit is still Procrustes.
+#
+#   uv run scripts/ablation_sweep.py
+
+defaults:
+  - rkhs@_here_
+  - _self_
+
+orthogonal_residual: false

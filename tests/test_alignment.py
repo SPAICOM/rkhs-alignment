@@ -42,6 +42,7 @@ from src.alignment import (
     prune_anchors,
     reconstruction_metrics,
     retrieval_metrics,
+    select_pilot_path,
     select_pilots,
 )
 from src.alignment.cca import _robust_svd
@@ -507,12 +508,21 @@ def test_dropping_the_constraint_breaks_orthogonality():
     assert aligner.summary()['rkhs_orthogonality'] > 1e-3
 
 
-def test_resolving_at_another_lambda_matches_a_fresh_fit():
+# RKA and its two ablations: no constraint, then no rigid stage either.
+_RKA_VARIANTS = [
+    {},
+    {'orthogonal_residual': False},
+    {'orthogonal_residual': False, 'rigid_stage': False},
+]
+
+
+@pytest.mark.parametrize('variant', _RKA_VARIANTS)
+def test_resolving_at_another_lambda_matches_a_fresh_fit(variant):
     """`set_lam` reuses the eigendecomposition; the model must not notice."""
     X, Y = paired_data()
-    swept = RKHSAligner(lam=1e-6, lam_grid=None).fit(X, Y)
+    swept = RKHSAligner(lam=1e-6, lam_grid=None, **variant).fit(X, Y)
     for lam in (1e-4, 1e-2, 1.0):
-        fresh = RKHSAligner(lam=lam, lam_grid=None).fit(X, Y)
+        fresh = RKHSAligner(lam=lam, lam_grid=None, **variant).fit(X, Y)
         swept.set_lam(lam)
         assert np.allclose(swept.transform(X), fresh.transform(X), atol=1e-10)
         for key in ('rkhs_dof', 'rkhs_residual_r2', 'rkhs_orthogonality'):
@@ -528,6 +538,77 @@ def test_large_lambda_collapses_onto_procrustes():
 
     assert np.abs(rkhs.A_).max() < 1e-8
     assert np.allclose(rkhs.transform(X), procrustes.transform(X), atol=1e-6)
+
+
+def test_dropping_the_rigid_stage_is_plain_kernel_ridge():
+    """``Q = 0`` and ``E = Y``: centred kernel ridge from source to target."""
+    X, Y = paired_data()
+    n, lam = X.shape[0], 1e-3
+    aligner = RKHSAligner(
+        lam=lam,
+        lam_grid=None,
+        lam_scaling='n',
+        orthogonal_residual=False,
+        rigid_stage=False,
+    ).fit(X, Y)
+
+    Z_src = aligner.scaler_src_.transform(X)
+    J = np.eye(n) - 1.0 / n
+    Kc = J @ aligner.kernel_spec(Z_src, Z_src) @ J
+    A = np.linalg.solve(
+        Kc + n * lam * np.eye(n), aligner.scaler_tgt_.transform(Y)
+    )
+    expected = aligner.scaler_tgt_.inverse_transform(Kc @ A)
+
+    assert np.allclose(aligner.transform(X), expected, atol=1e-8)
+    assert not aligner.Q.any()
+    assert aligner.summary()['procrustes_regime'] == 'none'
+
+
+def test_without_the_rigid_stage_large_lambda_collapses_onto_the_mean():
+    X, Y = paired_data()
+    aligner = RKHSAligner(
+        lam=1e9, lam_grid=None, orthogonal_residual=False, rigid_stage=False
+    ).fit(X, Y)
+    mean = np.broadcast_to(Y.mean(axis=0), Y.shape)
+    assert np.allclose(aligner.transform(X), mean, atol=1e-6)
+    assert np.allclose(aligner.transform_linear(X), mean, atol=1e-10)
+
+
+def test_plain_lambda_is_textbook_kernel_ridge():
+    """`lam_scaling='plain'` shifts the Gram eigenvalues by `lam` itself."""
+    X, Y = paired_data()
+    n, lam = X.shape[0], 0.5
+    aligner = RKHSAligner(
+        lam=lam,
+        lam_grid=None,
+        lam_scaling='plain',
+        orthogonal_residual=False,
+        rigid_stage=False,
+    ).fit(X, Y)
+
+    assert aligner.summary()['rkhs_lam_effective'] == pytest.approx(lam)
+
+    Z_src = aligner.scaler_src_.transform(X)
+    J = np.eye(n) - 1.0 / n
+    Kc = J @ aligner.kernel_spec(Z_src, Z_src) @ J
+    A = np.linalg.solve(Kc + lam * np.eye(n), aligner.scaler_tgt_.transform(Y))
+    expected = aligner.scaler_tgt_.inverse_transform(Kc @ A)
+    assert np.allclose(aligner.transform(X), expected, atol=1e-8)
+
+
+def test_the_conventions_are_one_path():
+    """'plain' at `lam` is 'n' at `lam / N`: the same fit, relabelled."""
+    X, Y = paired_data()
+    n = X.shape[0]
+    plain = RKHSAligner(lam=0.5, lam_grid=None, lam_scaling='plain').fit(X, Y)
+    scaled = RKHSAligner(lam=0.5 / n, lam_grid=None, lam_scaling='n').fit(X, Y)
+    assert np.allclose(plain.transform(X), scaled.transform(X), atol=1e-10)
+
+
+def test_the_constraint_needs_the_rigid_stage():
+    with pytest.raises(ValueError, match='orthogonal_residual=False'):
+        RKHSAligner(rigid_stage=False)
 
 
 def test_trace_scaling_is_a_reparametrisation():
@@ -1625,6 +1706,64 @@ def test_kernel_herding_beats_random_at_matching_the_pool():
 
     assert herded < min(draws), 'herding should beat every random draw'
     assert herded < 0.25 * float(np.mean(draws))
+
+
+_ADVERSARIAL = ['anti_herding', 'ball', 'classes:2']
+
+
+@pytest.mark.parametrize('design', _ADVERSARIAL)
+def test_adversarial_designs_return_usable_indices(design):
+    X, y = clustered_pool()
+    idx = select_pilots(X, 40, strategy=design, labels=y, seed=SEED)
+
+    assert idx.ndim == 1 and idx.size <= 40
+    assert idx.size == np.unique(idx).size, 'pilots must not repeat'
+    assert idx.min() >= 0 and idx.max() < X.shape[0]
+    assert np.array_equal(idx, np.sort(idx))
+
+
+def test_anti_herding_is_herdings_mirror():
+    """Same score, opposite sign: it maximises the MMD herding minimises."""
+    X, _ = clustered_pool()
+    kernel = Kernel('rbf').fit(X, seed=SEED)
+
+    herded = _mmd2(X, select_pilots(X, 40, strategy='herding'), kernel)
+    against = _mmd2(X, select_pilots(X, 40, strategy='anti_herding'), kernel)
+    draws = [
+        _mmd2(X, select_pilots(X, 40, strategy='random', seed=s), kernel)
+        for s in range(8)
+    ]
+
+    assert herded < min(draws), 'herding should beat every random draw'
+    assert against > max(draws), 'anti-herding should lose to every draw'
+
+
+@pytest.mark.parametrize('design', _ADVERSARIAL)
+def test_adversarial_designs_are_nested(design):
+    """A sweep slices one ordering, so the small budget is a prefix."""
+    X, y = clustered_pool()
+    path = select_pilot_path(
+        X, counts=[10, 40], strategy=design, labels=y, seed=SEED
+    )
+    assert set(path[10].tolist()) <= set(path[40].tolist())
+    assert path[10].size == 10 and path[40].size == 40
+
+
+def test_classes_design_withholds_the_other_classes():
+    X, y = clustered_pool()
+    idx = select_pilots(X, 30, strategy='classes:2', labels=y, seed=SEED)
+    assert np.unique(y[idx]).size == 2, 'only two classes may appear'
+    assert np.unique(y).size > 2, 'the pool must have classes to withhold'
+
+
+def test_classes_design_needs_labels_and_a_count():
+    X, _ = clustered_pool()
+    with pytest.raises(ValueError, match='requires per-sample labels'):
+        select_pilots(X, 10, strategy='classes:2', seed=SEED)
+    with pytest.raises(ValueError, match='positive class count'):
+        select_pilots(X, 10, strategy='classes:0', seed=SEED)
+    with pytest.raises(ValueError, match='takes no parameter'):
+        select_pilots(X, 10, strategy='herding:2', seed=SEED)
 
 
 def test_herding_fits_the_bandwidth_of_a_supplied_kernel():

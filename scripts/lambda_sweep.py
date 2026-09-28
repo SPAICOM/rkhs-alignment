@@ -254,15 +254,33 @@ def fit_on(
     pilots: np.ndarray,
     agents: dict[str, dict[str, LatentSpace]],
     pair: tuple[str, str],
+    use_local_context: bool = True,
 ) -> Aligner:
-    """Fit one aligner on one pilot set."""
+    """Fit one aligner on one pilot set.
+
+    ``use_local_context`` estimates each side's chart -- the truncated
+    whitening or PCA -- from that device's whole local split rather than
+    from the pilots. Standardising one space needs no pairing, so a
+    device can do it from everything it holds and only the paired rows
+    cost airtime; tying the chart to the pilot budget understates the
+    low-budget regime instead. The lambda this sweep measures is then on
+    the same chart the studies that read it back fit on, which is what
+    keeps the schedule meaningful.
+    """
     source, target = pair
     src_train, tgt_train = agents[source]['train'], agents[target]['train']
     labels = src_train.labels
+    context: dict[str, np.ndarray] = {}
+    if use_local_context:
+        context = {
+            'src_context': src_train.latent,
+            'tgt_context': tgt_train.latent,
+        }
     return aligner.fit(
         src_train.latent[pilots],
         tgt_train.latent[pilots],
         labels=None if labels is None else labels[pilots],
+        **context,
     )
 
 
@@ -295,7 +313,11 @@ def score(
 ) -> dict[str, float]:
     """Fit one aligner on one pilot set and score the whole test split."""
     return evaluate(
-        cfg, fit_on(aligner, pilots, agents, pair), agents, pair, decoder
+        cfg,
+        fit_on(aligner, pilots, agents, pair, cfg.use_local_context),
+        agents,
+        pair,
+        decoder,
     )
 
 
@@ -398,6 +420,7 @@ def sweep_cell(
                                 pilots,
                                 agents,
                                 (source, target),
+                                cfg.use_local_context,
                             )
                         scores = evaluate(
                             cfg,

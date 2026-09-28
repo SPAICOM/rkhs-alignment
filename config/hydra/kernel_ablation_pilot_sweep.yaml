@@ -1,0 +1,74 @@
+# Ablation of RKA over the pilot budget.
+#
+# Figure (ii) with RKA's two ablations in place of the neural baselines:
+#
+#   rkhs       -- RKA, read back from figure (ii)'s records, never refitted
+#   rkhs_free  -- Procrustes + kernel ridge, no orthogonality constraint
+#   krr        -- pure kernel alignment: no Procrustes, no constraint
+#
+# against Procrustes. Everything else is `pilot_sweep.yaml`: the seeds,
+# the pool, the herding pass, the decoder. So at a given (seed, budget)
+# the ablations see exactly the pilots RKA was fitted on. Procrustes is
+# refitted alongside them and checked against its reused records, which
+# is what proves that.
+#
+# Each ablation's lambda is read back per budget, as RKA's is, from its
+# own lambda sweep at bandwidth scale 1. Run that first:
+#
+#   uv run scripts/kernel_ablation_sweep.py bandwidths=null \
+#       'pilots.counts=[128,256,512,1024,2048,4096,8192]' \
+#       'variants=[rkhs_free,krr]'
+#   just kernel-ablation-pilot-sweep
+#   just kernel-ablation-pilot-sweep plot_only=true
+
+defaults:
+  - pilot_sweep
+  - alignment@methods.rkhs_free: rkhs_free
+  - alignment@methods.krr: krr
+  - _self_
+
+# Fitted here. Procrustes is not needed on the figure -- the reused copy
+# is drawn -- but it costs nothing and it is the check that the pilots
+# match the ones RKA saw.
+fit: [procrustes, rkhs_free, krr]
+
+# Read back from another study's records and never refitted. They must
+# cover every (design, budget, seed) of this run.
+reuse:
+  study: pilot_sweep
+  methods: [procrustes, rkhs]
+
+# The figure's methods, in hue order.
+show: [procrustes, rkhs, rkhs_free, krr]
+
+# --- the cell ---------------------------------------------------------
+# The pair and axes of figure (ii) for regnety_016 -> vit_large_p16.
+data:
+  models:
+    - regnety_016.pycls_in1k
+    - vit_large_patch16_224.augreg_in21k_ft_in1k
+
+charts:
+  - preprocess: whiten
+ranks: [32]
+
+pilots:
+  counts: [128, 256, 512, 1024, 2048, 4096, 8192]
+  strategies: [herding]
+
+seeds: [0, 1, 2, 3, 4]
+
+decoder:
+  kind: linear
+
+# Every kernel variant reads the lambda that maximised accuracy at its
+# own bandwidth (the preset's `bandwidth_scale`, 1.0) from the ablation
+# sweep's CSVs. RKA is not in the list: its records already carry the
+# lambda it was fitted at.
+lam_schedule:
+  methods: [rkhs_free, krr]
+  study: kernel_ablation
+  pattern: kernel_ablation_*.csv
+
+output:
+  study: kernel_ablation

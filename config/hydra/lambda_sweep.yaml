@@ -124,34 +124,66 @@ pilots:
   strategy: herding     # random | kmeans | fps | stratified | herding
   n_repeats: 1          # herding is deterministic, so 1 unless randomised
 
+# --- local standardisation -------------------------------------------
+# Estimate each side's chart -- the truncated whitening or PCA of
+# `alignment.preprocess` -- from that device's whole local split rather
+# than from the pilots.
+#
+# Standardising one latent space needs no pairing, so a device can do it
+# from everything it holds; only the paired rows cost airtime. Tying the
+# chart to the pilot budget instead makes the low-budget regime look far
+# worse than it is -- on the Digits pair it is worth +14 accuracy points
+# at N=5 and +7 at N=8 -- and it changes which method wins: measured on
+# regnety_016 -> vit_large at k=32, N=48, pure kernel alignment gains
+# +2.9 pp from the local chart while RKA gains +0.3 pp, because RKA's
+# rigid stage was partly absorbing the badly conditioned pilot
+# covariance.
+#
+# On by default since 2026-09-18, in every study, so the chart means the
+# same thing everywhere. `lambda_sweep.py` honours it too, so a schedule
+# read back by another study was measured on the chart that study fits
+# on. Results produced before that date are on the pilot-fitted chart
+# and are not comparable.
+use_local_context: true
+
 # --- receiver decoder -------------------------------------------------
 decoder:
   enabled: true
   # The receiver's task head, fitted on its own raw latents and never on
   # a transported one.
   #
-  # `mlp`, not `linear`, and the reason is specific to this encoder pair.
-  # A linear probe makes `decoder(align(x))` an *affine* classifier on the
-  # transmitter's latent, so post-alignment accuracy is capped by the best
-  # affine classifier the transmitter admits -- 0.9207 here, above the
-  # receiver's own 0.9120, because vit_small is the better CIFAR-10
-  # encoder. Both methods then sit on that cap and their accuracy ordering
-  # is noise: measured at N=400/800/1536 the linear head ranks RKA *below*
-  # Procrustes (-0.0006/-0.0004/-0.0003) while MRR, which uses no decoder
-  # at all, ranks it above (+0.0014/+0.0077/+0.0078).
+  # `linear`, and the same head in every study: `pair_average.yaml` pools
+  # the pilot and dimension sweeps and can only do that if both scored
+  # with the head it declares, and the kernel-ablation configs have
+  # always used it. Leaving the three sweeps on `mlp` meant the default
+  # `just pilot-sweep` -> `just pair-average` chain silently mixed two
+  # instruments; the lambda a sweep measures maximises accuracy, so the
+  # head propagates into the schedule as well as the score.
   #
-  # The MLP head lifts the receiver's own accuracy to 0.9228, back above
-  # the transmitter's affine cap, so "native RX" is a ceiling again and
-  # nothing transported beats it. It also ranks the methods the way the
-  # decoder-free metric does (+0.0010/+0.0008/+0.0008).
+  # The case for `mlp` was measured on a pair this repo no longer leads
+  # with, and does not carry over. A linear probe makes
+  # `decoder(align(x))` an *affine* classifier on the transmitter's
+  # latent, so post-alignment accuracy is capped by the best affine
+  # classifier the transmitter admits. On the old vit_small pair that cap
+  # was 0.9207, *above* the receiver's own 0.9120 -- the transmitter was
+  # the better CIFAR-10 encoder -- so both methods sat on it and their
+  # accuracy ordering was noise (RKA -0.0006/-0.0004/-0.0003 against
+  # Procrustes at N=400/800/1536, while decoder-free MRR ranked it above:
+  # +0.0014/+0.0077/+0.0078). The MLP head lifted the receiver to 0.9228
+  # and restored "native RX" as a ceiling.
   #
-  # The cost is real and worth knowing: an expressive head partly rescues
-  # a badly fitted map, so it compresses the pilot axis. Over N=50..1536
+  # The five pairs in `pair_average.yaml` are the other way round --
+  # CIFAR-10-weak CNN transmitters into strong ViT receivers, chosen for
+  # exactly that headroom -- so the transmitter's affine cap sits well
+  # below the receiver's accuracy and the inversion does not arise.
+  #
+  # `mlp` also costs resolution, which matters for the pilot axis: an
+  # expressive head partly rescues a badly fitted map, so over N=50..1536
   # the linear head spans 0.797..0.902 and the MLP only 0.823..0.902 --
-  # low budgets look better than they are. Switch back with
-  # `decoder.kind=linear` when the question is how much a pilot is worth
-  # rather than which map is better.
-  kind: mlp
+  # low budgets look better than they are. Set `decoder.kind=mlp`
+  # deliberately, and for every study in the chain at once, if a pair
+  # ever puts the transmitter above the receiver again.
+  kind: linear
   checkpoint_dir: models/decoders
   cache: true
   n_classes: 10

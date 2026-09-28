@@ -1,0 +1,109 @@
+# Diagnostics behind the kernel ablation.
+#
+# Four read-only studies, one per question, selected with `study`:
+#
+#   mechanism    -- the class geometry of each method's transported test
+#                   latents, against the receiver's own on the same chart.
+#                   Shows the least-squares shrinkage that wins a probe
+#                   and loses retrieval.
+#   whitening    -- the canonical correlations, i.e. why that shrinkage
+#                   survives whitening.
+#   stationarity -- alternating the two closed-form blocks: RKA is a fixed
+#                   point, the unconstrained variant is not.
+#   screen       -- rms(rho) per encoder pair, then RKA vs pure kernel on
+#                   the least and most predictable ones.
+#
+# Nothing here writes a CSV; each prints a table.
+#
+#   just kernel-diagnostics
+#   just kernel-diagnostics study=whitening
+#   just kernel-diagnostics study=stationarity n_pilots=4096
+#   just kernel-diagnostics study=screen screen.n_extremes=3
+
+defaults:
+  - data: semasia
+  - alignment@methods.procrustes: procrustes
+  - alignment@methods.linear: linear
+  - alignment@methods.rkhs: rkhs
+  - alignment@methods.rkhs_free: rkhs_free
+  - alignment@methods.krr: krr
+  - _self_
+
+study: mechanism        # mechanism | whitening | stationarity | screen
+
+seed: 0
+
+# --- the cell ---------------------------------------------------------
+# One pair, one rate, one budget: these studies explain a mechanism, so
+# they are deliberately cheap and single-realisation.
+transmitter: regnety_016.pycls_in1k
+receiver: vit_large_patch16_224.augreg_in21k_ft_in1k
+symbols: 32             # the whitening rank both spaces keep
+n_pilots: 2048
+bandwidth_scale: 1.0
+
+pilots:
+  # Smaller than the sweeps' 50000: herding is quadratic in the pool and
+  # these studies do not have to match a sweep's pilots point for point.
+  pool_size: 10000
+
+# Methods that take a `lam`, so the studies know which ones to pin.
+kernel_methods: [rkhs, rkhs_free, krr]
+
+mechanism:
+  # Procrustes and the plain ridge bracket the kernel variants: the ridge
+  # is the least-squares linear map, which is where the shrinkage comes
+  # from, and Procrustes is the same map constrained to an isometry.
+  methods: [procrustes, linear, rkhs, rkhs_free, krr]
+  # The accuracy-best lambda measured at this cell by the lambda sweep,
+  # in the `n` convention (shift = N * lam).
+  lam: 1.0e-4
+
+stationarity:
+  lam: 1.0e-4
+  iterations: 6
+
+screen:
+  receivers:
+    - vit_large_patch16_224.augreg_in21k_ft_in1k
+    - aimv2_large_patch14_224.apple_pt
+    - eva02_base_patch14_224.mim_in22k
+    - beit_base_patch16_224.in22k_ft_in22k
+  transmitters:
+    - regnety_016.pycls_in1k
+    - repvgg_b0.rvgg_in1k
+    - mobilenetv3_large_100.ra_in1k
+    - ghostnet_100.in1k
+    - efficientvit_b0.r224_in1k
+    - resnet50.a1_in1k
+    - convnext_base.fb_in1k
+    - deit3_base_patch16_224.fb_in1k
+    - swin_base_patch4_window7_224.ms_in1k
+    - vit_small_patch16_224.augreg_in21k_ft_in1k
+    - caformer_b36.sail_in1k
+    - davit_base.msft_in1k
+  # How many pairs from each end of the rho ordering to actually fit.
+  n_extremes: 5
+  lam_grid: [1.0e-7, 1.0e-6, 1.0e-5, 3.1623e-5, 1.0e-4, 3.1623e-4, 1.0e-3,
+             1.0e-2, 1.0e-1]
+
+# The receiver's task head, as in the sweeps this explains.
+decoder:
+  enabled: true
+  kind: linear
+  checkpoint_dir: models/decoders
+  cache: true
+  n_classes: 10
+  l2: 1.0e-6
+  mlp:
+    hidden_dim: 512
+    lr: 1.0e-3
+    max_epochs: 100
+    patience: 10
+    batch_size: 256
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false
