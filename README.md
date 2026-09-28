@@ -196,7 +196,10 @@ If you find this code useful for your research, please consider citing the follo
 
 ## Authors
 
-- [EXAMPLE](https://scholar.google.com/citations?user=EXAMPLE)
+- [Enrico Grimaldi](https://scholar.google.com/citations?user=Y-31eCwAAAAJ)
+- [Gabriele D'Acunto](https://scholar.google.com/citations?user=dIVgmlUAAAAJ)
+- [Sergio Barbarossa](https://scholar.google.com/citations?user=2woHFu8AAAAJ)
+- [Paolo Di Lorenzo](https://scholar.google.com/citations?user=VZYvspQAAAAJ)
 
 ## Used Technologies
 
